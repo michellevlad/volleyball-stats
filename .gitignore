@@ -1,0 +1,11 @@
+data/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
+*.tmp
+.env
+service_account.json
+tests/fixtures/*.gz
+tests/fixtures/*.pdf

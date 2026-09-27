@@ -1,0 +1,13 @@
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+# Elden VBK: flame orange on near-black, sampled from the club crest.
+[theme]
+base = "dark"
+primaryColor = "#F7941E"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#171B26"
+textColor = "#FAFAFA"

@@ -1,0 +1,1190 @@
+"""Elden VBK volleyball box-score entry.
+
+Run with:  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pandas as pd
+import streamlit as st
+
+from volley import config, profixio, schema, sheets, stats, store, video
+
+LOGO = config.logo_path()
+
+st.set_page_config(page_title=f"{config.club_name()} · Stats", page_icon="🏐", layout="wide")
+
+# Streamlit spaces every block a full row apart, which pushes the buttons well
+# below the video. Only the entry strip is tightened; the rest keeps its air.
+TIGHTEN_ENTRY = """
+<style>
+  .st-key-entry_strip { margin-top: -1.4rem; }
+  .st-key-entry_strip [data-testid="stCaptionContainer"] { margin-bottom: -0.4rem; }
+</style>
+"""
+
+BOX_SCORE_VIEW = [
+    "player_num", "player_name", "player_role", "points", "kills", "attack_errors",
+    "attempts", "kill_pct", "hitting_eff", "aces", "serve_errors", "reception_count",
+    "pass_rating", "blocks", "digs", "assists",
+]
+
+
+# --- small state helpers ----------------------------------------------------
+
+def init_state() -> None:
+    defaults = {
+        "match_id": "",
+        "set_no": 1,
+        "sel_player": None,
+        "sel_action": None,
+        "flash": None,
+        "spreadsheet": None,
+        "spreadsheet_title": "",
+        "mapping": {},
+        "tab_titles": [],
+        "show_video": True,
+        "video_layout": "On top",
+        "video_height": 420,
+        "video_width": 4,
+        "setup_done_for": "",
+        "connect_attempted": False,
+        "auth_command": "",
+        "allow_scoring": False,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def flash(kind: str, message: str) -> None:
+    st.session_state.flash = (kind, message)
+
+
+def score_keys(match_id: str, set_no: int) -> tuple[str, str]:
+    return f"score_us::{match_id}::{set_no}", f"score_them::{match_id}::{set_no}"
+
+
+def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None:
+    """Seed the score widgets from the last event of the set (survives a restart)."""
+    us_key, them_key = score_keys(match_id, set_no)
+    if us_key not in st.session_state or them_key not in st.session_state:
+        us, them = store.current_score(events, match_id, set_no)
+        st.session_state.setdefault(us_key, us)
+        st.session_state.setdefault(them_key, them)
+
+
+def current_video_id() -> str | None:
+    return video.parse_youtube_id(st.session_state.get("video_url_current", ""))
+
+
+# --- recording --------------------------------------------------------------
+
+def scoring_is_locked(match_id: str, action: str, result: str) -> bool:
+    """Point-scoring actions belong to the protocol once it has been imported."""
+    if st.session_state.get("allow_scoring"):
+        return False
+    if not schema.is_point(action, result):
+        return False
+    return store.has_profixio_events(match_id)
+
+
+def commit(match: dict, player: dict, action: str, result: str) -> None:
+    match_id = match["match_id"]
+    set_no = int(st.session_state.set_no)
+
+    if scoring_is_locked(match_id, action, result):
+        flash(
+            "error",
+            f"`{action.lower()} {result}` is already in this match from the official "
+            "protocol. Record the attempts, errors, receptions and digs instead - or "
+            "switch on *Allow scoring actions* in the sidebar if the protocol missed it.",
+        )
+        return
+
+    us_key, them_key = score_keys(match_id, set_no)
+    if schema.is_point(action, result):
+        st.session_state[us_key] = int(st.session_state[us_key]) + 1
+
+    events = store.load_events()
+    event = store.build_event(
+        match=match,
+        set_no=set_no,
+        seq=store.next_seq(events, match_id, set_no),
+        player=player,
+        action=action,
+        result=result,
+        score_us=int(st.session_state[us_key]),
+        score_them=int(st.session_state[them_key]),
+        role=store.role_of(match_id, set_no, player["number"], player.get("position", "")),
+    )
+    store.append_event(event)
+    st.session_state.sel_player = None
+    st.session_state.sel_action = None
+    flash("success",
+          f"#{event['player_num']} {event['player_name']} · {action.lower()} {result}")
+
+
+# --- callbacks (run before the script reruns) ------------------------------
+
+def cb_pick_player(player: dict) -> None:
+    st.session_state.sel_player = player
+    st.session_state.sel_action = None
+
+
+def cb_pick_action(action: str) -> None:
+    st.session_state.sel_action = action
+
+
+def cb_pick_result(match: dict, result: str) -> None:
+    player = st.session_state.sel_player
+    action = st.session_state.sel_action
+    if player and action:
+        commit(match, player, action, result)
+
+
+def cb_clear_selection() -> None:
+    st.session_state.sel_player = None
+    st.session_state.sel_action = None
+
+
+def cb_goto_set(set_no: int) -> None:
+    st.session_state.set_no = int(set_no)
+    st.session_state.sel_player = None
+    st.session_state.sel_action = None
+
+
+def cb_bump(key: str, delta: int) -> None:
+    st.session_state[key] = max(0, int(st.session_state[key]) + delta)
+
+
+def cb_undo(event_id: str) -> None:
+    store.delete_event(event_id)
+    flash("success", "Event removed")
+
+
+def cb_new_match() -> None:
+    """Create a match that is not in Profixio - a friendly, say."""
+    opponent = st.session_state.get("new_opponent", "").strip()
+    if not opponent:
+        flash("error", "Opponent is required")
+        return
+    match_date = st.session_state.get("new_date", date.today()).isoformat()
+    match_id = store.new_match_id(match_date, opponent)
+    store.upsert_match({
+        "match_id": match_id,
+        "date": match_date,
+        "opponent": opponent,
+        "home_away": st.session_state.get("new_home_away", "home"),
+        "competition": "",
+        "sets_won": 0,
+        "sets_lost": 0,
+        "video_url": "",
+        "profixio_match_id": "",
+        "squad": "",
+        "official_result": "",
+        "official_sets": "",
+        "notes": "",
+    })
+    st.session_state.match_id = match_id
+    st.session_state.set_no = 1
+    flash("success", f"Match created: {match_id}")
+
+
+def cb_reopen_setup() -> None:
+    st.session_state.setup_done_for = ""
+
+
+def cb_start_entering(match_id: str, numbers: list) -> None:
+    """Save the squad from the checkboxes and open the workspace."""
+    picked = [n for n in numbers if st.session_state.get(f"squad::{match_id}::{n}")]
+    store.set_squad(match_id, picked)
+    st.session_state.setup_done_for = match_id
+
+
+def cb_save_video_url(match: dict) -> None:
+    url = st.session_state.get("video_url_input", "").strip()
+    if url and not video.parse_youtube_id(url):
+        flash("error", "That does not look like a YouTube URL")
+        return
+    store.upsert_match({**match, "video_url": url})
+    flash("success", "Video linked to this match" if url else "Video unlinked")
+
+
+# --- sidebar ----------------------------------------------------------------
+
+def sidebar_branding() -> None:
+    if LOGO.exists():
+        st.logo(str(LOGO), size="large")
+        st.sidebar.image(str(LOGO), width=120)
+    else:
+        st.sidebar.markdown("### ELDEN VBK")
+        st.sidebar.caption("Add assets/elden-vbk.png for the club logo.")
+
+
+def connect(spreadsheet_id: str, announce: bool = True) -> bool:
+    """Open the spreadsheet and work out the tab mapping. Never raises."""
+    try:
+        client = sheets.get_client()
+        spreadsheet = sheets.open_spreadsheet(client, spreadsheet_id)
+        st.session_state.spreadsheet = spreadsheet
+        st.session_state.spreadsheet_title = spreadsheet.title
+        st.session_state.mapping = sheets.resolve_mapping(
+            spreadsheet, store.load_sheet_config()
+        )
+        st.session_state.tab_titles = sheets.list_tab_titles(spreadsheet)
+        if announce:
+            flash("success", f"Connected to {spreadsheet.title}")
+        return True
+    except sheets.SheetsError as exc:
+        st.session_state.spreadsheet = None
+        st.session_state.auth_command = getattr(exc, "command", "")
+        flash("error", str(exc))
+    except Exception as exc:
+        st.session_state.spreadsheet = None
+        st.session_state.auth_command = ""
+        flash("error", f"Could not connect: {exc}")
+    return False
+
+
+def sidebar_connection() -> None:
+    st.sidebar.subheader("Google Sheets")
+    spreadsheet_id = st.sidebar.text_input(
+        "Spreadsheet ID",
+        value=config.spreadsheet_id(),
+        key="spreadsheet_id",
+        help="Saved in .env - you should not need to touch this.",
+    )
+
+    # Connect by itself on first load, so the normal case needs no clicking.
+    if not st.session_state.connect_attempted and spreadsheet_id.strip():
+        st.session_state.connect_attempted = True
+        connect(spreadsheet_id, announce=False)
+
+    if st.session_state.spreadsheet is not None:
+        st.sidebar.success(f"Connected · {st.session_state.spreadsheet_title}")
+    else:
+        st.sidebar.warning("Not connected")
+    if st.sidebar.button("Connect", key="connect", width="stretch"):
+        if not spreadsheet_id.strip():
+            flash("error", "Paste a spreadsheet ID first")
+        else:
+            connect(spreadsheet_id)
+
+    if st.session_state.spreadsheet is None:
+        return
+
+    with st.sidebar.expander("Tab mapping"):
+        st.caption(
+            "Which existing tab holds each kind of data. Rows are appended and "
+            "unknown columns are left alone \u2014 nothing here is ever rewritten."
+        )
+        titles = st.session_state.tab_titles
+        chosen = {}
+        for role, default_title in schema.MAPPABLE_ROLES.items():
+            options = list(titles)
+            new_option = f"\u2795 create \u201c{default_title}\u201d"
+            if default_title not in options:
+                options.append(new_option)
+            current = st.session_state.mapping.get(role, default_title)
+            if current not in options:
+                options.append(current)
+            chosen[role] = st.selectbox(
+                role.title(), options, index=options.index(current), key=f"map::{role}"
+            )
+            if chosen[role] == new_option:
+                chosen[role] = default_title
+        if st.button("Save mapping", key="save_mapping", width="stretch"):
+            st.session_state.mapping = chosen
+            store.save_sheet_config(chosen)
+            flash("success", "Tab mapping saved")
+        st.caption(
+            "A push writes " + ", ".join(f"`{t}`" for t in config.push_tabs())
+            + " — set `VOLLEY_PUSH_TABS` in .env to change that. Tabs rebuilt from "
+            "scratch each push are not mappable."
+        )
+
+
+def sidebar_push(events: pd.DataFrame) -> None:
+    pending = len(store.unsynced(events))
+    label = f"Push to Sheets ({pending} new)" if pending else "Push to Sheets"
+    disabled = st.session_state.spreadsheet is None
+    if st.sidebar.button(label, key="push", type="primary", width="stretch", disabled=disabled):
+        try:
+            result = sheets.push(
+                st.session_state.spreadsheet,
+                events.drop(columns=schema.LOCAL_ONLY_COLUMNS, errors="ignore"),
+                store.load_matches(),
+                st.session_state.mapping,
+                store.load_lineup(),
+            )
+            store.mark_synced(events["event_id"])
+            written = ", ".join(f"{title} ({rows})" for title, rows in result["tabs"].items())
+            flash("success",
+                  f"Published {written} from {result['events_total']} events.")
+        except sheets.SheetsError as exc:
+            flash("error", str(exc))
+        except Exception as exc:
+            flash("error", f"Push failed: {exc}")
+    if disabled:
+        st.sidebar.caption("Connect a spreadsheet to enable pushing.")
+        return
+
+    archives_events = schema.TAB_EVENTS in config.push_tabs()
+    if st.sidebar.button("⬇ Restore from Sheets", key="restore", width="stretch",
+                         disabled=not archives_events,
+                         help="Pull archived events back into this machine"):
+        try:
+            title = st.session_state.mapping.get("events", schema.TAB_EVENTS)
+            result = store.restore_events(
+                sheets.read_events(st.session_state.spreadsheet, title)
+            )
+            flash("success",
+                  f"Restored {result['added']} event(s); "
+                  f"{result['already_here']} were already here.")
+        except Exception as exc:
+            flash("error", f"Could not restore: {exc}")
+    if not archives_events:
+        st.sidebar.caption(
+            "Only `PlayerSetStats` is published, and an aggregate cannot be turned back "
+            "into events. Add `Events` to `VOLLEY_PUSH_TABS` in .env to make this machine "
+            "recoverable."
+        )
+
+
+def sidebar_match(matches: pd.DataFrame) -> None:
+    st.sidebar.subheader("Match")
+    match_id = st.session_state.match_id
+    row = matches[matches["match_id"] == match_id]
+    if len(row):
+        match = row.iloc[0]
+        st.sidebar.markdown(
+            f"**{match['opponent']}**  \n{match['date']} \u00b7 {match['home_away']}"
+        )
+    else:
+        st.sidebar.caption("No match selected.")
+    if st.sidebar.button("\u2699 Match setup", key="reopen_setup", width="stretch"):
+        st.session_state.setup_done_for = ""
+        st.rerun()
+
+    st.sidebar.radio("Set", [1, 2, 3, 4, 5], key="set_no", horizontal=True)
+
+    if store.has_profixio_events(st.session_state.match_id):
+        st.sidebar.toggle(
+            "Allow scoring actions", key="allow_scoring",
+            help="The official protocol already has every point. Switch this on only "
+                 "if it is missing something.",
+        )
+
+    st.sidebar.subheader("Video")
+    st.sidebar.toggle("Show video", key="show_video")
+    if st.session_state.show_video:
+        st.sidebar.radio(
+            "Layout", ["On top", "Side by side"], key="video_layout", horizontal=True,
+            help="On top gives the player the full width of the window.",
+        )
+        if st.session_state.video_layout == "On top":
+            st.sidebar.slider("Height", 240, 800, step=20, key="video_height")
+        else:
+            st.sidebar.slider(
+                "Width", 3, 7, key="video_width", help="How much of the row the video takes."
+            )
+
+
+def sidebar_roster(roster: pd.DataFrame) -> None:
+    st.sidebar.subheader("Roster")
+    with st.sidebar.expander("Edit roster", expanded=not len(roster)):
+        edited = st.data_editor(
+            roster if len(roster) else pd.DataFrame(columns=schema.ROSTER_COLUMNS),
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "player_id": st.column_config.TextColumn("id", help="left blank = auto"),
+                "number": st.column_config.NumberColumn("#", min_value=0, max_value=99, step=1),
+                "active": st.column_config.CheckboxColumn("active", default=True),
+            },
+            key="roster_editor",
+        )
+        if st.button("Save roster", key="save_roster", width="stretch"):
+            store.save_roster(edited)
+            flash("success", "Roster saved")
+            st.rerun()
+        if st.session_state.spreadsheet is not None:
+            title = st.session_state.mapping.get("roster", schema.TAB_ROSTER)
+            col_a, col_b = st.columns(2)
+            if col_a.button("⬇ From Sheets", key="roster_pull", width="stretch"):
+                try:
+                    store.save_roster(sheets.read_roster(st.session_state.spreadsheet, title))
+                    flash("success", f"Roster loaded from “{title}”")
+                    st.rerun()
+                except Exception as exc:
+                    flash("error", f"Could not read roster: {exc}")
+            if col_b.button("⬆ To Sheets", key="roster_push", width="stretch"):
+                try:
+                    sheets.write_roster(st.session_state.spreadsheet, title, store.load_roster())
+                    flash("success", f"Roster written to “{title}”")
+                except Exception as exc:
+                    flash("error", f"Could not write roster: {exc}")
+
+
+# --- main panels ------------------------------------------------------------
+
+def scoreboard(match: dict, set_no: int) -> None:
+    us_key, them_key = score_keys(match["match_id"], set_no)
+    left, mid_a, mid_b, right = st.columns([3, 1, 1, 2])
+    left.markdown(
+        f"### {match['opponent']}  \n{match['date']} · {match['home_away']} · **set {set_no}**"
+    )
+    mid_a.number_input("Us", min_value=0, step=1, key=us_key)
+    mid_b.number_input("Them", min_value=0, step=1, key=them_key)
+    right.markdown("&nbsp;", unsafe_allow_html=True)
+    bump_us, bump_them = right.columns(2)
+    bump_us.button(
+        "+1 us", key=f"bump::{us_key}", on_click=cb_bump, args=(us_key, 1), width="stretch",
+        help="Point from an opponent error - no player event recorded",
+    )
+    bump_them.button(
+        "+1 them", key=f"bump::{them_key}", on_click=cb_bump, args=(them_key, 1),
+        width="stretch", help="Opponent point",
+    )
+
+
+def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
+    """Move between sets without going to the sidebar, and know when one is done.
+
+    A set is 'done' once what you entered matches the official score for it, so
+    finishing a set and moving on is one glance and one click.
+    """
+    entered = stats.per_set_scores(match_events)
+    entered_by_set = {
+        int(row["set_no"]): f"{int(row['score_us'])}-{int(row['score_them'])}"
+        for row in entered.to_dict("records")
+    }
+    official = [
+        part.strip() for part in str(match.get("official_sets", "") or "").split(",")
+        if part.strip()
+    ]
+    official_by_set = {index: value for index, value in enumerate(official, start=1)}
+
+    # Always all five. Guessing how many sets a match has leaves sets 4 and 5
+    # unreachable before it has been played.
+    columns = st.columns(6)
+    for index, number in enumerate(range(1, 6)):
+        mine = entered_by_set.get(number)
+        theirs = official_by_set.get(number)
+        if mine and theirs and mine == theirs:
+            label = f"Set {number} ✅"
+        elif mine:
+            label = f"Set {number} ·"
+        else:
+            label = f"Set {number}"
+        columns[index].button(
+            label,
+            key=f"goto_set::{number}",
+            on_click=cb_goto_set,
+            args=(number,),
+            width="stretch",
+            type="primary" if number == set_no else "secondary",
+            help=f"Profixio {theirs} · entered {mine or '—'}" if theirs else None,
+        )
+
+    mine = entered_by_set.get(set_no)
+    theirs = official_by_set.get(set_no)
+    matches_official = bool(mine and theirs and mine == theirs)
+    columns[-1].button(
+        f"Set {set_no + 1} →" if set_no < 5 else "Last set",
+        key="next_set",
+        on_click=cb_goto_set,
+        args=(min(5, set_no + 1),),
+        width="stretch",
+        disabled=set_no >= 5,
+        type="primary" if matches_official else "secondary",
+        help="Start entering the next set. The line-up carries over.",
+    )
+    if matches_official:
+        st.caption(f"Set {set_no} matches the official {theirs} — ready for the next one.")
+
+
+def video_panel(match: dict, max_height: int = 2000) -> None:
+    """The player, plus the in-panel entry box that carries the video clock."""
+    url = match.get("video_url", "") or ""
+    video_id = video.parse_youtube_id(url)
+
+    with st.expander("Match video URL", expanded=not url):
+        st.text_input(
+            "YouTube URL", value=url, key="video_url_input", placeholder="https://youtu.be/…",
+            label_visibility="collapsed",
+        )
+        st.button(
+            "Link video", key="save_video_url", on_click=cb_save_video_url, args=(match,),
+            width="stretch",
+        )
+        if url and not video_id:
+            st.error("No YouTube video id found in that URL.")
+        elif video_id:
+            st.caption(
+                f"[Open on YouTube](https://youtu.be/{video_id}) — private videos cannot be "
+                "embedded, unlisted works."
+            )
+
+    return video.video_panel(video_id, max_height=max_height)
+
+
+def player_label(player: dict, squad: list) -> str:
+    """`#1 Michelle` - full names make the buttons three lines tall.
+
+    Falls back to a surname initial only if two of the called-up players share
+    a first name.
+    """
+    parts = str(player.get("name", "")).split()
+    first = parts[0] if parts else ""
+    clashes = [p for p in squad if str(p.get("name", "")).split()[:1] == [first]]
+    if len(clashes) > 1 and len(parts) > 1:
+        first = f"{first} {parts[1][0]}."
+    return f"#{int(player['number'])} {first}".strip()
+
+
+def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
+    """Player -> action -> result, three taps, meant to sit under the video."""
+    players = store.squad_players(roster, match)
+    if not len(players):
+        st.warning("Nobody called up. Reopen Match setup to pick the squad.")
+        return
+
+    squad = players.to_dict("records")
+    selected = st.session_state.sel_player
+
+    st.caption("Player")
+    per_row = min(8, max(4, len(squad)))
+    columns = st.columns(per_row)
+    for index, player in enumerate(squad):
+        is_selected = bool(selected and selected["player_id"] == player["player_id"])
+        columns[index % per_row].button(
+            player_label(player, squad),
+            key=f"player::{player['player_id']}",
+            on_click=cb_pick_player,
+            args=(player,),
+            width="stretch",
+            type="primary" if is_selected else "secondary",
+        )
+
+    if not selected:
+        st.caption("Pick a player to see the actions.")
+        return
+
+    st.caption(f"Action · #{selected['number']} {selected['name']}")
+    action_columns = st.columns(len(schema.ACTION_ORDER) + 1)
+    for index, action in enumerate(schema.ACTION_ORDER):
+        action_columns[index].button(
+            action.title(),
+            key=f"action::{action}",
+            on_click=cb_pick_action,
+            args=(action,),
+            width="stretch",
+            type="primary" if st.session_state.sel_action == action else "secondary",
+        )
+    action_columns[-1].button(
+        "✕", key="cancel", on_click=cb_clear_selection, width="stretch", help="Cancel"
+    )
+
+    action = st.session_state.sel_action
+    if not action:
+        return
+
+    st.caption(f"Result · {action.title()}")
+    results = schema.ACTIONS[action]
+    result_columns = st.columns(len(results))
+    for index, result in enumerate(results):
+        locked = scoring_is_locked(st.session_state.match_id, action, result)
+        result_columns[index].button(
+            schema.result_label(action, result),
+            key=f"result::{action}::{result}",
+            on_click=cb_pick_result,
+            args=(match, result),
+            width="stretch",
+            type="secondary" if locked else "primary",
+            disabled=locked,
+            help="Already imported from the official protocol" if locked else None,
+        )
+
+
+def entry_panel(roster: pd.DataFrame, match: dict) -> None:
+    entry_buttons(roster, match)
+
+
+def box_score(match_events: pd.DataFrame, matches: pd.DataFrame, match: dict) -> None:
+    st.subheader("Box score")
+    if not len(match_events):
+        st.caption("Nothing entered yet.")
+        return
+    sources = set(str(s) for s in match_events["source"])
+    if sources <= {schema.SOURCE_PROFIXIO}:
+        st.info(
+            "Official protocol only. It records scoring actions, so attempts, errors, "
+            "receptions and digs are still missing \u2014 rates like hitting efficiency "
+            "and pass rating are not meaningful until you have been through the video."
+        )
+
+    # Rates are worked out here for the screen only; the spreadsheet stores
+    # counts and Looker does the arithmetic.
+    players = stats.with_rates(stats.player_match_stats(match_events, matches))
+    st.dataframe(
+        players[BOX_SCORE_VIEW].sort_values("points", ascending=False),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "kill_pct": st.column_config.NumberColumn("kill %", format="%.3f"),
+            "hitting_eff": st.column_config.NumberColumn("hit eff", format="%.3f"),
+            "pass_rating": st.column_config.NumberColumn("pass", format="%.2f"),
+            "player_num": st.column_config.NumberColumn("#"),
+            "player_name": st.column_config.TextColumn("player"),
+            "player_role": st.column_config.TextColumn("role"),
+            "reception_count": st.column_config.NumberColumn("recept"),
+            "attack_errors": st.column_config.NumberColumn("att err"),
+            "serve_errors": st.column_config.NumberColumn("srv err"),
+            "blocks": st.column_config.NumberColumn("blocks"),
+        },
+    )
+    team = stats.with_rates(stats.team_match_stats(match_events, matches))
+    if len(team):
+        row = team.iloc[0]
+        cols = st.columns(5)
+        cols[0].metric("Points", f"{row['points']:.1f}")
+        cols[1].metric("Hitting eff", f"{row['hitting_eff']:.3f}")
+        cols[2].metric("Kills / errors", f"{int(row['kills'])} / {int(row['attack_errors'])}")
+        cols[3].metric("Aces / srv errors", f"{int(row['aces'])} / {int(row['serve_errors'])}")
+        cols[4].metric("Pass rating", f"{row['pass_rating']:.2f}")
+        official_comparison(match, row, match_events)
+
+
+def recent_events(match_events: pd.DataFrame) -> None:
+    st.subheader("Recent")
+    if not len(match_events):
+        st.caption("Nothing entered yet.")
+        return
+    ordered = match_events.sort_values(["set_no", "seq"]).tail(12).iloc[::-1]
+    for event in ordered.to_dict("records"):
+        line, undo = st.columns([7, 1])
+        line.write(
+            f"S{event['set_no']} · #{event['player_num']} {event['player_name']} · "
+            f"**{event['action'].lower()}** {event['action_result']}"
+            f"  `{event['score_us']}-{event['score_them']}`"
+        )
+        undo.button(
+            "✕", key=f"undo::{event['event_id']}", on_click=cb_undo, args=(event["event_id"],)
+        )
+
+
+def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
+    with st.expander(f"Edit all {len(match_events)} events of this match"):
+        if not len(match_events):
+            st.caption("Nothing to edit.")
+            return
+        display = match_events[schema.EVENT_COLUMNS].copy()
+        editable = ["set_no", "seq", "player_num", "action", "action_result"]
+        all_results = sorted({r for results in schema.ACTIONS.values() for r in results})
+        edited = st.data_editor(
+            display,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            disabled=[c for c in display.columns if c not in editable],
+            column_config={
+                "action": st.column_config.SelectboxColumn(options=list(schema.ACTIONS)),
+                "action_result": st.column_config.SelectboxColumn(options=all_results),
+                "player_num": st.column_config.NumberColumn("#", min_value=0, max_value=99),
+            },
+            key=f"editor::{match_id}",
+        )
+        col_save, col_download = st.columns(2)
+        if col_save.button("Save edits", key="save_edits", width="stretch"):
+            save_edits(edited, roster, match_id)
+        col_download.download_button(
+            "Download this match (CSV)",
+            match_events[schema.EVENT_COLUMNS].to_csv(index=False),
+            file_name=f"{match_id}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+
+def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
+    """Re-validate every edited row, then write the whole match back to the buffer."""
+    problems = []
+    rows = []
+    for position, row in enumerate(edited.to_dict("records"), start=1):
+        try:
+            action, result = schema.validate(row["action"], row["action_result"])
+        except schema.InvalidEvent as exc:
+            problems.append(f"row {position}: {exc}")
+            continue
+        player = store.find_by_number(roster, row["player_num"])
+        if player is not None:
+            row["player_name"] = player["name"]
+        row["action"], row["action_result"] = action, result
+        row["is_point"] = schema.is_point(action, result)
+        rows.append(row)
+
+    if problems:
+        flash("error", "Not saved - " + "; ".join(problems))
+        return
+
+    events = store.load_events()
+    edited_ids = {row["event_id"] for row in rows}
+    updated = pd.DataFrame(rows)
+    updated["synced"] = False   # edited rows need re-pushing
+    events = store.concat_frames([events[~events["event_id"].isin(edited_ids)], updated])
+    store.save_events(events)
+    flash("success", f"Saved {len(rows)} event(s)")
+    st.rerun()
+
+
+# --- match setup ------------------------------------------------------------
+
+def cb_sync_profixio() -> None:
+    settings = config.profixio()
+    try:
+        html = profixio.fetch_team_page(
+            settings["league_id"], settings["team_id"], settings["key"]
+        )
+        players = profixio.parse_roster(html)
+        fixtures = profixio.parse_fixtures(html, settings["team_name"])
+        store.merge_profixio_roster(players)
+        store.merge_profixio_fixtures(fixtures)
+        played = sum(1 for f in fixtures if f["played"])
+        flash("success", f"Profixio: {len(fixtures)} fixtures ({played} played), "
+                         f"{len(players)} players")
+    except profixio.ProfixioError as exc:
+        flash("error", str(exc))
+
+
+def import_protocol(match: dict, pdf_bytes: bytes) -> None:
+    """Replace this match's imported events with a freshly parsed protocol."""
+    try:
+        protocol = profixio.parse_protocol(profixio.extract_pdf_text(pdf_bytes))
+        team = config.team_name()
+        summary = profixio.protocol_summary(protocol, team)
+        events = profixio.protocol_to_events(
+            protocol, team, match["match_id"], store.load_roster()
+        )
+        if not events:
+            flash("error", f"No {team} events found in that protocol - wrong match?")
+            return
+        store.replace_profixio_events(match["match_id"], events)
+        store.restamp_roles(match["match_id"])   # imported rows get roles too
+        flash("success",
+              f"{summary['rows']} rows → {len(events)} events · "
+              f"{summary['points_for']}-{summary['points_against']} points · "
+              f"result {summary['result']}")
+    except profixio.ProfixioError as exc:
+        flash("error", str(exc))
+
+
+def cb_import_file(match: dict, path) -> None:
+    try:
+        import_protocol(match, profixio.read_protocol_file(path))
+    except profixio.ProfixioError as exc:
+        flash("error", str(exc))
+
+
+def cb_import_upload(match: dict, upload_key: str) -> None:
+    uploaded = st.session_state.get(upload_key)
+    if uploaded is None:
+        return
+    import_protocol(match, uploaded.getvalue())
+
+
+def protocol_section(match: dict, match_events: pd.DataFrame) -> None:
+    profixio_id = str(match.get("profixio_match_id", "") or "")
+    st.markdown("**Official protocol**")
+    if not profixio_id:
+        st.caption("No Profixio match linked, so there is no protocol to import.")
+        return
+
+    imported = match_events[match_events["source"] == schema.SOURCE_PROFIXIO]
+    if len(imported):
+        st.success(f"{len(imported)} events already imported.")
+
+    found = profixio.find_downloaded_protocol(profixio_id)
+    if found is not None:
+        st.button(f"⬇ Import {found.name}", key="import_found", type="primary",
+                  width="stretch", on_click=cb_import_file, args=(match, found))
+
+    upload_key = f"upload::{match['match_id']}"
+    uploaded = st.file_uploader("or drop the Arbetsprotokoll PDF", type="pdf", key=upload_key)
+    if uploaded is not None:
+        st.button("Import uploaded protocol", key="import_upload", width="stretch",
+                  on_click=cb_import_upload, args=(match, upload_key))
+
+    url = profixio.protocol_url(config.profixio()["league_id"], profixio_id)
+    st.caption(
+        f"[Download the Arbetsprotokoll]({url}) — Profixio puts a bot check on this "
+        "link, so it has to be saved from the browser. Once it is in Downloads it is "
+        "picked up automatically."
+    )
+
+
+def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
+    """Who is playing which role in one set.
+
+    Roles live per (match, set) because players move between them mid-match,
+    and the whole point of recording them is to compare a player's numbers
+    across the roles they actually played.
+    """
+    if not players:
+        st.caption("Nobody called up yet.")
+        return
+
+    current = store.roles_for_set(match_id, set_no)
+    frame = pd.DataFrame([
+        {
+            "player_num": int(player["number"]),
+            "player_name": player["name"],
+            "player_role": current.get(
+                int(player["number"]), player.get("position", "") or ""
+            ),
+        }
+        for player in players
+    ])
+    edited = st.data_editor(
+        frame,
+        key=key,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "player_num": st.column_config.NumberColumn("#", disabled=True),
+            "player_name": st.column_config.TextColumn("player", disabled=True),
+            "player_role": st.column_config.SelectboxColumn(
+                "role", options=[""] + schema.ROLES, required=False
+            ),
+        },
+    )
+    if st.button("Save roles", key=f"{key}::save", width="stretch"):
+        by_number = {int(p["number"]): p for p in players}
+        rows = []
+        for record in edited.to_dict("records"):
+            player = by_number.get(int(record["player_num"]))
+            if player is None:
+                continue
+            rows.append({
+                "player_num": int(record["player_num"]),
+                "player_name": record["player_name"],
+                "player_role": str(record["player_role"] or ""),
+            })
+        store.set_lineup(match_id, set_no, rows)
+        # Events already recorded carry a role; push the change through so the
+        # two cannot quietly disagree.
+        store.restamp_roles(match_id, set_no)
+        flash("success", f"Roles saved for set {set_no}")
+        st.rerun()
+
+
+def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: dict) -> None:
+    """Most sets start the same as the one before, so carry it forward."""
+    if len(store.match_lineup(match_id, set_no)):
+        return
+    for previous in range(int(set_no) - 1, 0, -1):
+        if len(store.match_lineup(match_id, previous)):
+            store.copy_lineup(match_id, previous, int(set_no))
+            return
+    squad = store.squad_players(roster, match)
+    if len(squad):
+        store.set_lineup(match_id, int(set_no), [
+            {
+                "player_num": int(player["number"]),
+                "player_name": player["name"],
+                "player_role": player.get("position", "") or "",
+            }
+            for player in squad.to_dict("records")
+        ])
+
+
+def squad_section(roster: pd.DataFrame, match: dict) -> list:
+    st.markdown("**Called up**")
+    if not len(roster):
+        st.caption("No roster yet. Refresh from Profixio.")
+        return []
+    called = set(store.squad_numbers(match))
+    if not called:
+        called = set(int(n) for n in store.active_players(roster)["number"])
+
+    numbers, picked = [], []
+    players = roster.sort_values("number").to_dict("records")
+    columns = st.columns(2)
+    for index, player in enumerate(players):
+        number = int(player["number"])
+        numbers.append(number)
+        checked = columns[index % 2].checkbox(
+            f"#{number} {player['name']}",
+            value=number in called,
+            key=f"squad::{match['match_id']}::{number}",
+        )
+        if checked:
+            picked.append(number)
+    st.caption(f"{len(picked)} of {len(players)} selected")
+    return numbers
+
+
+def default_match_id(matches: pd.DataFrame) -> str:
+    """The match you most likely want: the last one played, else the next one up.
+
+    Matches are stored newest-first, so falling back to row zero would land on
+    the final fixture of the season - never the useful answer.
+    """
+    if not len(matches):
+        return ""
+    played = matches[matches["official_result"].astype(str) != ""]
+    if len(played):
+        return played.sort_values("date").iloc[-1]["match_id"]
+    today = date.today().isoformat()
+    upcoming = matches[matches["date"].astype(str) >= today].sort_values("date")
+    if len(upcoming):
+        return upcoming.iloc[0]["match_id"]
+    return matches.sort_values("date").iloc[-1]["match_id"]
+
+
+def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
+    st.subheader("Match setup")
+
+    if not len(matches):
+        st.info("No matches yet. Pull the season from Profixio to get started.")
+        st.button("↻ Refresh from Profixio", key="sync_empty",
+                  on_click=cb_sync_profixio, type="primary")
+        return
+
+    options = list(matches["match_id"])
+    labels = {}
+    for row in matches.itertuples():
+        result = f" · {row.official_result}" if row.official_result else ""
+        labels[row.match_id] = f"{row.date} · {row.opponent} ({row.home_away}){result}"
+    current = st.session_state.match_id or default_match_id(matches)
+    index = options.index(current) if current in options else 0
+    chosen = st.selectbox(
+        "Match", options, index=index, format_func=lambda m: labels.get(m, m), key="setup_match"
+    )
+    st.session_state.match_id = chosen
+    match = matches[matches["match_id"] == chosen].iloc[0].to_dict()
+    match_events = store.match_events(store.load_events(), chosen)
+
+    left, right = st.columns(2)
+    with left:
+        if match.get("official_result"):
+            st.markdown(
+                f"**Official result** `{match['official_result']}`  \n"
+                f"{match.get('official_sets', '')}"
+            )
+        st.text_input(
+            "YouTube URL", value=match.get("video_url", "") or "",
+            key="video_url_input", placeholder="https://youtu.be/…",
+        )
+        st.button("Save video URL", key="save_video_setup",
+                  on_click=cb_save_video_url, args=(match,), width="stretch")
+        st.divider()
+        protocol_section(match, match_events)
+
+    with right:
+        numbers = squad_section(roster, match)
+        with st.expander("Starting roles (set 1)"):
+            called = set(store.squad_numbers(match)) or set(numbers)
+            players = [
+                p for p in roster.sort_values("number").to_dict("records")
+                if int(p["number"]) in called
+            ]
+            role_editor(chosen, 1, players, key=f"roles::setup::{chosen}")
+        st.divider()
+        st.button("↻ Refresh from Profixio", key="sync_profixio",
+                  on_click=cb_sync_profixio, width="stretch")
+        with st.expander("➕ Match not in Profixio"):
+            st.date_input("Date", value=date.today(), key="new_date")
+            st.text_input("Opponent", key="new_opponent")
+            st.selectbox("Home / away", ["home", "away", "neutral"], key="new_home_away")
+            st.button("Create match", key="create_match",
+                      on_click=cb_new_match, width="stretch")
+        st.button("Start entering →", key="start_entering", type="primary",
+                  width="stretch", on_click=cb_start_entering, args=(chosen, numbers))
+
+
+def official_comparison(match: dict, team_row, match_events: pd.DataFrame) -> None:
+    """Profixio's official set scores beside what the entered events add up to.
+
+    Set by set rather than as one lump, so a set can be checked the moment it
+    is finished instead of only discovering at the end of the match that one of
+    them went in under the wrong number.
+    """
+    official_sets = [
+        part.strip() for part in str(match.get("official_sets", "") or "").split(",")
+        if part.strip()
+    ]
+    official_result = str(match.get("official_result", "") or "")
+    if not official_sets and not official_result:
+        return
+
+    entered = stats.per_set_scores(match_events)
+    entered_by_set = {
+        int(row["set_no"]): f"{int(row['score_us'])}-{int(row['score_them'])}"
+        for row in entered.to_dict("records")
+    }
+
+    tick, warn, blank = "✅", "⚠️", "—"
+    rows, all_agree = [], True
+    for index, official in enumerate(official_sets, start=1):
+        mine = entered_by_set.get(index, "")
+        if not mine:
+            rows.append((f"Set {index}", official, blank, "not entered yet"))
+            all_agree = False
+            continue
+        agrees = mine == official
+        all_agree = all_agree and agrees
+        rows.append((f"Set {index}", official, mine, tick if agrees else warn))
+
+    # Sets entered that the official record doesn't have at all.
+    for set_no in sorted(set(entered_by_set) - set(range(1, len(official_sets) + 1))):
+        rows.append((f"Set {set_no}", blank, entered_by_set[set_no], warn))
+        all_agree = False
+
+    result_mine = f"{int(team_row['sets_won'])}-{int(team_row['sets_lost'])}"
+    if official_result:
+        agrees = result_mine == official_result
+        all_agree = all_agree and agrees
+        rows.append(("Result", official_result, result_mine, tick if agrees else warn))
+
+    with st.container(border=True):
+        st.markdown(f"**Official vs entered** {tick if all_agree else warn}")
+        st.dataframe(
+            pd.DataFrame(rows, columns=["Set", "Profixio", "Entered", "Match"]),
+            hide_index=True,
+            width="stretch",
+        )
+        if not all_agree:
+            st.caption(
+                "A set that doesn't match usually means events went in under the wrong "
+                "set number, or that set isn't finished yet."
+            )
+
+
+# --- workspace --------------------------------------------------------------
+
+@st.fragment
+def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
+    """Everything that reruns when you record an event.
+
+    Isolating this in a fragment keeps the sidebar and the page header out of
+    the rerun, which matters because the video component is in here: fewer
+    render passes, no chance of the player being disturbed by unrelated work.
+    """
+    match_id = match["match_id"]
+    set_no = int(st.session_state.set_no)
+    show_video = st.session_state.show_video
+    # Set here, not inside the panel: collapsing the video must not stop events
+    # from carrying their deep link.
+    st.session_state.video_url_current = match.get("video_url", "") or ""
+
+    # Seed the score before anything can record: a submission arriving from the
+    # video panel is handled inline, not in a callback, so unlike the button
+    # grid it reaches commit() during this very first script run.
+    events = store.load_events()
+    ensure_score_state(events, match_id, set_no)
+    ensure_set_lineup(match_id, set_no, roster, match)
+
+    on_top = st.session_state.video_layout == "On top"
+    if show_video and on_top:
+        video_panel(match, max_height=int(st.session_state.video_height))
+    elif show_video:
+        share = int(st.session_state.video_width)
+        left, right = st.columns([10 - share, share])
+        with right:
+            video_panel(match)
+
+    match_events = store.match_events(events, match_id)
+
+    if st.session_state.flash:
+        kind, message = st.session_state.flash
+        (st.success if kind == "success" else st.error)(message)
+        st.session_state.flash = None
+
+    if show_video and on_top:
+        # Everything you touch while watching, before anything else claims the
+        # space. st.columns() reserves its row at the point it is called, so the
+        # box score must not be created until the buttons are on screen.
+        st.html(TIGHTEN_ENTRY)
+        with st.container(key="entry_strip"):
+            entry_buttons(roster, match)
+        scoreboard(match, set_no)
+        set_navigator(match, set_no, match_events)
+        with st.expander(f"Roles · set {set_no}"):
+            role_editor(
+                match_id, set_no,
+                store.squad_players(roster, match).to_dict("records"),
+                key=f"roles::{match_id}::{set_no}",
+            )
+        st.divider()
+        left, right = st.columns([3, 2])
+    elif not show_video:
+        left, right = st.columns([3, 2])
+
+    with left:
+        if not (show_video and on_top):
+            scoreboard(match, set_no)
+            set_navigator(match, set_no, match_events)
+            st.divider()
+            entry_panel(roster, match)
+            with st.expander(f"Roles · set {set_no}"):
+                role_editor(
+                    match_id, set_no,
+                    store.squad_players(roster, match).to_dict("records"),
+                    key=f"roles::{match_id}::{set_no}",
+                )
+            st.divider()
+        box_score(match_events, matches, match)
+
+    with right:
+        recent_events(match_events)
+
+    full_editor(match_events, roster, match_id)
+
+
+# --- page -------------------------------------------------------------------
+
+def main() -> None:
+    init_state()
+    roster = store.load_roster()
+    matches = store.load_matches()
+    events = store.load_events()
+
+    sidebar_branding()
+
+    if LOGO.exists():
+        crest, title = st.columns([1, 11])
+        crest.image(str(LOGO), width=64)
+        title.title(f"{config.club_name()} · Volleyball Stats")
+    else:
+        st.title(f"🏐 {config.club_name()} · Volleyball Stats")
+
+    sidebar_connection()
+    sidebar_match(matches)
+    sidebar_roster(roster)
+    st.sidebar.divider()
+    sidebar_push(events)
+
+    if st.session_state.flash:
+        kind, message = st.session_state.flash
+        (st.success if kind == "success" else st.error)(message)
+        if kind == "error" and st.session_state.get("auth_command"):
+            st.code(st.session_state.auth_command, language="bash")
+        st.session_state.flash = None
+
+    match_id = st.session_state.match_id
+    known = match_id and len(matches[matches["match_id"] == match_id])
+
+    # The setup gate: pick the match, the video and the squad before entering.
+    if not known or st.session_state.setup_done_for != match_id:
+        setup_screen(matches, roster)
+        return
+
+    match = matches[matches["match_id"] == match_id].iloc[0].to_dict()
+    workspace(match, roster, matches)
+
+
+main()

@@ -1,0 +1,157 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Match video</title>
+<style>
+  :root {
+    --orange: #F7941E;
+    --bg: #0e1117;
+    --panel: #171b26;
+    --text: #fafafa;
+    --muted: #8b93a7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  /* Bounding the *height* is what keeps 16:9 usable across the full page
+     width - a percentage padding alone would make it 1000px tall. */
+  #player-wrap { max-width: calc(var(--max-h, 2000px) * 16 / 9); margin: 0 auto; }
+  #player-box {
+    position: relative; width: 100%; padding-top: 56.25%;
+    background: #000; border-radius: 8px; overflow: hidden;
+  }
+  #player-box > iframe, #player { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #placeholder {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 1rem; color: var(--muted); font-size: 0.9rem; line-height: 1.5;
+  }
+  #bar {
+    display: flex; align-items: baseline; gap: 0.75rem;
+    margin: 0.35rem 0 0; font-size: 0.78rem; color: var(--muted);
+  }
+  #clock {
+    font-variant-numeric: tabular-nums; font-size: 1.05rem; font-weight: 700;
+    color: var(--orange); letter-spacing: 0.02em;
+  }
+  kbd {
+    background: var(--panel); border: 1px solid #2b3244; border-radius: 4px;
+    padding: 0 0.3em; font-size: 0.9em; font-family: inherit;
+  }
+</style>
+
+<div id="player-wrap">
+<div id="player-box">
+  <div id="player"></div>
+  <div id="placeholder">Paste a YouTube URL for this match in the sidebar.<br>
+    Private videos cannot be embedded &mdash; unlisted works.</div>
+</div>
+</div>
+<div id="bar">
+  <span id="clock">0:00</span>
+  <span><kbd>space</kbd> play/pause &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> 5s &middot;
+    <kbd>shift</kbd> 1s</span>
+</div>
+
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+(function () {
+  var player = null;
+  var apiReady = false;
+  var currentVideoId = "";
+  var pendingVideoId = "";
+
+  var clock = document.getElementById("clock");
+  var placeholder = document.getElementById("placeholder");
+
+  // --- Streamlit component protocol ---------------------------------------
+  function post(message) {
+    message.isStreamlitMessage = true;
+    window.parent.postMessage(message, "*");
+  }
+  function setHeight() {
+    post({ type: "streamlit:setFrameHeight", height: document.body.scrollHeight + 2 });
+  }
+
+  function currentSeconds() {
+    if (player && typeof player.getCurrentTime === "function") {
+      try { return player.getCurrentTime(); } catch (err) { return null; }
+    }
+    return null;
+  }
+
+  function formatTime(seconds) {
+    if (seconds === null || isNaN(seconds)) return "0:00";
+    var total = Math.floor(seconds);
+    var h = Math.floor(total / 3600);
+    var m = Math.floor((total % 3600) / 60);
+    var s = total % 60;
+    var mm = h ? String(m).padStart(2, "0") : String(m);
+    return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
+  }
+
+  // The clock ticks locally. It deliberately does NOT message Streamlit -
+  // that would rerun the app several times a second.
+  setInterval(function () { clock.textContent = formatTime(currentSeconds()); }, 250);
+
+  // --- player -------------------------------------------------------------
+  window.onYouTubeIframeAPIReady = function () {
+    apiReady = true;
+    if (pendingVideoId) createPlayer(pendingVideoId);
+  };
+
+  function createPlayer(videoId) {
+    placeholder.style.display = "none";
+    player = new YT.Player("player", {
+      videoId: videoId,
+      playerVars: { rel: 0, modestbranding: 1, playsinline: 1 }
+    });
+    currentVideoId = videoId;
+  }
+
+  function applyVideo(videoId) {
+    if (!videoId) { return; }
+    // THE load-bearing check: only touch the player when the id actually
+    // changed. Reloading on every render would restart the video on every
+    // recorded event and defeat the whole feature.
+    if (videoId === currentVideoId) return;
+    if (!apiReady) { pendingVideoId = videoId; return; }
+    if (!player) { createPlayer(videoId); return; }
+    currentVideoId = videoId;
+    player.cueVideoById(videoId);   // cue, not load: never autoplay on a rerun
+  }
+
+  function seekBy(delta) {
+    var now = currentSeconds();
+    if (player && now !== null) player.seekTo(Math.max(0, now + delta), true);
+  }
+
+  function togglePlay() {
+    if (!player) return;
+    var state = player.getPlayerState();
+    if (state === YT.PlayerState.PLAYING) player.pauseVideo();
+    else player.playVideo();
+  }
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowLeft") { ev.preventDefault(); seekBy(ev.shiftKey ? -1 : -5); return; }
+    if (ev.key === "ArrowRight") { ev.preventDefault(); seekBy(ev.shiftKey ? 1 : 5); return; }
+    if (ev.key === " ") { ev.preventDefault(); togglePlay(); return; }
+  });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.type !== "streamlit:render") return;
+    var args = data.args || {};
+    applyVideo(args.video_id || "");
+    if (args.max_height) {
+      document.documentElement.style.setProperty("--max-h", args.max_height + "px");
+    }
+    setHeight();
+  });
+
+  window.addEventListener("resize", setHeight);
+  post({ type: "streamlit:componentReady", apiVersion: 1 });
+  setHeight();
+})();
+</script>
