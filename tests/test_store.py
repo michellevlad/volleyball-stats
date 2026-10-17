@@ -174,3 +174,15 @@ def test_every_event_carries_the_match_details():
     event = make_event()
     assert event["match_date"] == "2026-09-26"
     assert event["match_name"] == "Elden VBK vs Lions"
+
+
+def test_two_players_cannot_share_a_shirt_in_one_set():
+    """A squad recorded in old numbering can collide with the current roster."""
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Luisa", "player_role": "OH"},
+        {"player_num": 4, "player_name": "Maryam", "player_role": "S"},
+    ])
+    squad = store.squad_players(pd.DataFrame(columns=schema.ROSTER_COLUMNS),
+                                {"match_id": "m1"}, 1)
+    assert list(squad["number"]) == [4]
+    assert list(squad["name"]) == ["Luisa"]

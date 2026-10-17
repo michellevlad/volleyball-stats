@@ -274,8 +274,30 @@ def squad_numbers(match: dict) -> list[int]:
     return [int(part) for part in re.findall(r"\d+", raw)]
 
 
-def squad_players(roster: pd.DataFrame, match: dict) -> pd.DataFrame:
-    """The roster narrowed to the called-up squad, in shirt-number order."""
+def squad_players(roster: pd.DataFrame, match: dict, set_no: int = 1) -> pd.DataFrame:
+    """Who is on court, wearing the number they wear *in this match*.
+
+    The line-up wins when there is one, because a shirt number belongs to a
+    match rather than to a season - Profixio reassigns them, and a player can
+    borrow a shirt for one game. The roster is only the fallback.
+    """
+    lineup = match_lineup(match.get("match_id", ""), set_no)
+    if len(lineup):
+        # One shirt, one player - a duplicate number would collide in the UI.
+        lineup = lineup.drop_duplicates("player_num", keep="first")
+        return pd.DataFrame(
+            [
+                {
+                    "player_id": f"p{int(row['player_num'])}",
+                    "number": int(row["player_num"]),
+                    "name": row["player_name"],
+                    "position": row["player_role"],
+                    "active": True,
+                }
+                for row in lineup.sort_values("player_num").to_dict("records")
+            ],
+            columns=schema.ROSTER_COLUMNS,
+        )
     called = squad_numbers(match)
     if not called:
         return active_players(roster)
@@ -296,21 +318,43 @@ def set_squad(match_id: str, numbers) -> pd.DataFrame:
 # event - survives a re-sync untouched.
 
 def merge_profixio_roster(players: list) -> pd.DataFrame:
+    """Refresh the roster from Profixio, matching players by *name*.
+
+    Shirt numbers change between matches, so keying on the number is wrong in
+    two ways at once: a player who switches number gets added a second time,
+    and whoever inherits her old number silently takes over her row. Names are
+    the stable thing.
+
+    Players no longer in the Profixio squad are kept but deactivated - their
+    recorded events still refer to them, and events store the number and name
+    as they were at the time, so history is unaffected either way. For everyone
+    still in the squad the `active` flag is left exactly as you set it.
+    """
     roster = load_roster()
-    existing = {int(row["number"]): row for row in roster.to_dict("records")}
-    merged = []
+    existing = {}
+    for row in roster.to_dict("records"):
+        existing.setdefault(str(row["name"]).strip(), row)
+
+    merged, seen = [], set()
     for player in players:
+        name = str(player["name"]).strip()
         number = int(player["number"])
-        current = existing.pop(number, None)
+        current = existing.get(name)
+        seen.add(name)
         if current is None:
             merged.append({
-                "player_id": f"p{number}", "number": number, "name": player["name"],
+                "player_id": f"p{number}", "number": number, "name": name,
                 "position": "", "active": True,
             })
         else:
-            merged.append({**current, "name": player["name"]})
-    # Players no longer listed are kept, not deleted - their events still exist.
-    merged.extend(existing.values())
+            # `active` is yours - someone can be in the registered squad and
+            # still be injured. A sync only ever changes the number.
+            merged.append({**current, "number": number, "name": name})
+
+    for name, row in existing.items():
+        if name not in seen:
+            merged.append({**row, "active": False})
+
     save_roster(pd.DataFrame(merged, columns=schema.ROSTER_COLUMNS))
     return load_roster()
 
@@ -475,6 +519,24 @@ def restamp_roles(match_id: str, set_no: int = None) -> pd.DataFrame:
     return events
 
 
+def protocol_count(match_id: str, set_no: int, number, action: str) -> int:
+    """How many of this action the official protocol already has for a player.
+
+    Shown while entering rather than used to block anything: the protocol is
+    usually right, but not every match is scored carefully, and a point put
+    against the wrong player has to be fixable.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id)
+        & (events["set_no"] == int(set_no))
+        & (events["player_num"] == int(number))
+        & (events["action"] == action)
+        & (events["source"] == schema.SOURCE_PROFIXIO)
+    ]
+    return len(rows)
+
+
 def has_profixio_events(match_id: str) -> bool:
     """Whether the official protocol has been imported for this match.
 
@@ -511,3 +573,28 @@ def restore_events(remote: pd.DataFrame) -> dict:
         "already_here": len(remote) - len(fresh),
         "total": len(load_events()),
     }
+
+
+def lineup_from_events(match_id: str, set_no: int) -> list:
+    """Who actually appears in a set's recorded events.
+
+    Used to repair a line-up that has fallen behind the events - which happens
+    when shirt numbers change and a number-keyed match drops somebody who is
+    plainly there in the data.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id) & (events["set_no"] == int(set_no))
+    ]
+    seen, out = set(), []
+    for row in rows.to_dict("records"):
+        number = int(row["player_num"])
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append({
+            "player_num": number,
+            "player_name": row["player_name"],
+            "player_role": row["player_role"],
+        })
+    return sorted(out, key=lambda r: r["player_num"])

@@ -52,7 +52,6 @@ def init_state() -> None:
         "setup_done_for": "",
         "connect_attempted": False,
         "auth_command": "",
-        "allow_scoring": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -81,27 +80,9 @@ def current_video_id() -> str | None:
 
 # --- recording --------------------------------------------------------------
 
-def scoring_is_locked(match_id: str, action: str, result: str) -> bool:
-    """Point-scoring actions belong to the protocol once it has been imported."""
-    if st.session_state.get("allow_scoring"):
-        return False
-    if not schema.is_point(action, result):
-        return False
-    return store.has_profixio_events(match_id)
-
-
 def commit(match: dict, player: dict, action: str, result: str) -> None:
     match_id = match["match_id"]
     set_no = int(st.session_state.set_no)
-
-    if scoring_is_locked(match_id, action, result):
-        flash(
-            "error",
-            f"`{action.lower()} {result}` is already in this match from the official "
-            "protocol. Record the attempts, errors, receptions and digs instead - or "
-            "switch on *Allow scoring actions* in the sidebar if the protocol missed it.",
-        )
-        return
 
     us_key, them_key = score_keys(match_id, set_no)
     if schema.is_point(action, result):
@@ -196,10 +177,9 @@ def cb_reopen_setup() -> None:
     st.session_state.setup_done_for = ""
 
 
-def cb_start_entering(match_id: str, numbers: list) -> None:
-    """Save the squad from the checkboxes and open the workspace."""
-    picked = [n for n in numbers if st.session_state.get(f"squad::{match_id}::{n}")]
-    store.set_squad(match_id, picked)
+def cb_start_entering(match_id: str) -> None:
+    """Save the one squad table and open the workspace."""
+    save_squad(match_id)
     st.session_state.setup_done_for = match_id
 
 
@@ -369,13 +349,6 @@ def sidebar_match(matches: pd.DataFrame) -> None:
         st.rerun()
 
     st.sidebar.radio("Set", [1, 2, 3, 4, 5], key="set_no", horizontal=True)
-
-    if store.has_profixio_events(st.session_state.match_id):
-        st.sidebar.toggle(
-            "Allow scoring actions", key="allow_scoring",
-            help="The official protocol already has every point. Switch this on only "
-                 "if it is missing something.",
-        )
 
     st.sidebar.subheader("Video")
     st.sidebar.toggle("Show video", key="show_video")
@@ -548,7 +521,7 @@ def player_label(player: dict, squad: list) -> str:
 
 def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
     """Player -> action -> result, three taps, meant to sit under the video."""
-    players = store.squad_players(roster, match)
+    players = store.squad_players(roster, match, int(st.session_state.set_no))
     if not len(players):
         st.warning("Nobody called up. Reopen Match setup to pick the squad.")
         return
@@ -597,16 +570,25 @@ def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
     results = schema.ACTIONS[action]
     result_columns = st.columns(len(results))
     for index, result in enumerate(results):
-        locked = scoring_is_locked(st.session_state.match_id, action, result)
         result_columns[index].button(
             schema.result_label(action, result),
             key=f"result::{action}::{result}",
             on_click=cb_pick_result,
             args=(match, result),
             width="stretch",
-            type="secondary" if locked else "primary",
-            disabled=locked,
-            help="Already imported from the official protocol" if locked else None,
+            type="primary",
+        )
+
+    # Not a warning, just what the protocol already holds - the scoresheet is
+    # usually right, but it is not always, and it is never the whole picture.
+    already = store.protocol_count(
+        match["match_id"], st.session_state.set_no, selected["number"], action
+    )
+    if already:
+        st.caption(
+            f"The official protocol already has {already} "
+            f"{action.lower()} point{'s' if already > 1 else ''} for "
+            f"#{selected['number']} in set {st.session_state.set_no}."
         )
 
 
@@ -882,67 +864,125 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
 
 
 def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: dict) -> None:
-    """Most sets start the same as the one before, so carry it forward."""
-    if len(store.match_lineup(match_id, set_no)):
-        return
-    for previous in range(int(set_no) - 1, 0, -1):
-        if len(store.match_lineup(match_id, previous)):
-            store.copy_lineup(match_id, previous, int(set_no))
-            return
-    squad = store.squad_players(roster, match)
-    if len(squad):
-        store.set_lineup(match_id, int(set_no), [
-            {
-                "player_num": int(player["number"]),
-                "player_name": player["name"],
-                "player_role": player.get("position", "") or "",
-            }
-            for player in squad.to_dict("records")
-        ])
+    """Make sure the set has a line-up, and that everyone called up is in it.
+
+    Most sets start the same as the one before, so the previous set is carried
+    forward. It is then topped up with anyone in the squad who is missing -
+    otherwise a player who has not touched the ball yet would have no button.
+    """
+    set_no = int(set_no)
+    existing = store.match_lineup(match_id, set_no).to_dict("records")
+
+    if not existing:
+        for previous in range(set_no - 1, 0, -1):
+            if len(store.match_lineup(match_id, previous)):
+                store.copy_lineup(match_id, previous, set_no)
+                existing = store.match_lineup(match_id, set_no).to_dict("records")
+                break
+
+    rows = [
+        {k: row[k] for k in ("player_num", "player_name", "player_role")}
+        for row in existing
+    ]
+    present = {str(row["player_name"]) for row in rows}
+    taken = {int(row["player_num"]) for row in rows}
+
+    called = set(store.squad_numbers(match))
+    candidates = roster[roster["number"].isin(called)] if called else store.active_players(roster)
+    for player in candidates.sort_values("number").to_dict("records"):
+        # Skip on either key. A squad recorded in last season's numbering can
+        # otherwise collide with whoever wears that shirt now.
+        if player["name"] in present or int(player["number"]) in taken:
+            continue
+        present.add(player["name"])
+        taken.add(int(player["number"]))
+        rows.append({
+            "player_num": int(player["number"]),
+            "player_name": player["name"],
+            "player_role": player.get("position", "") or "",
+        })
+
+    if rows and len(rows) != len(existing):
+        store.set_lineup(match_id, set_no, sorted(rows, key=lambda r: int(r["player_num"])))
+    elif not existing and rows:
+        store.set_lineup(match_id, set_no, rows)
 
 
-def squad_section(roster: pd.DataFrame, match: dict) -> list:
-    st.markdown("**Called up**")
+def squad_editor(roster: pd.DataFrame, match: dict, set_no: int = 1) -> None:
+    """Who is playing, wearing what, in which role - one table.
+
+    Call-up, shirt number and role used to be two separate controls listing the
+    same people. They are one now, because they are one decision.
+    """
+    match_id = match["match_id"]
     if not len(roster):
         st.caption("No roster yet. Refresh from Profixio.")
-        return []
-    called = set(store.squad_numbers(match))
-    if not called:
-        called = set(int(n) for n in store.active_players(roster)["number"])
+        return
 
-    numbers, picked = [], []
+    roles = store.roles_for_set(match_id, set_no)
+    lineup = store.match_lineup(match_id, set_no)
+    records = lineup.to_dict("records") if len(lineup) else []
+    # Matched by name, not number: a player who changed shirt between matches
+    # would otherwise silently drop out of a squad she is already in.
+    numbered = {str(r["player_name"]): int(r["player_num"]) for r in records}
+    named_roles = {str(r["player_name"]): r["player_role"] for r in records}
+    called_names = set(numbered)
+    called_numbers = set(store.squad_numbers(match))
+
     players = roster.sort_values("number").to_dict("records")
-    columns = st.columns(2)
-    for index, player in enumerate(players):
-        number = int(player["number"])
-        numbers.append(number)
-        checked = columns[index % 2].checkbox(
-            f"#{number} {player['name']}",
-            value=number in called,
-            key=f"squad::{match['match_id']}::{number}",
-        )
-        if checked:
-            picked.append(number)
-    st.caption(f"{len(picked)} of {len(players)} selected")
-    return numbers
+    frame = pd.DataFrame([
+        {
+            "called": (player["name"] in called_names) if called_names
+                      else (int(player["number"]) in called_numbers) if called_numbers
+                      else bool(player["active"]),
+            "player_num": numbered.get(player["name"], int(player["number"])),
+            "player_name": player["name"],
+            "player_role": named_roles.get(
+                player["name"],
+                roles.get(int(player["number"]), player.get("position", "") or ""),
+            ),
+        }
+        for player in players
+    ])
+
+    edited = st.data_editor(
+        frame,
+        key=f"squad::{match_id}::{set_no}",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "called": st.column_config.CheckboxColumn("✓", width="small"),
+            "player_num": st.column_config.NumberColumn(
+                "#", min_value=0, max_value=99, step=1,
+                help="Shirt worn in this match - change it here if it differs",
+            ),
+            "player_name": st.column_config.TextColumn("player", disabled=True),
+            "player_role": st.column_config.SelectboxColumn(
+                "role", options=[""] + schema.ROLES, required=False
+            ),
+        },
+    )
+    picked = edited[edited["called"].astype(bool)]
+    st.caption(f"{len(picked)} of {len(edited)} called up")
+    st.session_state[f"squad_edit::{match_id}"] = edited
 
 
-def default_match_id(matches: pd.DataFrame) -> str:
-    """The match you most likely want: the last one played, else the next one up.
-
-    Matches are stored newest-first, so falling back to row zero would land on
-    the final fixture of the season - never the useful answer.
-    """
-    if not len(matches):
-        return ""
-    played = matches[matches["official_result"].astype(str) != ""]
-    if len(played):
-        return played.sort_values("date").iloc[-1]["match_id"]
-    today = date.today().isoformat()
-    upcoming = matches[matches["date"].astype(str) >= today].sort_values("date")
-    if len(upcoming):
-        return upcoming.iloc[0]["match_id"]
-    return matches.sort_values("date").iloc[-1]["match_id"]
+def save_squad(match_id: str, set_no: int = 1) -> None:
+    """Persist the one table: squad numbers on the match, roles on the set."""
+    edited = st.session_state.get(f"squad_edit::{match_id}")
+    if edited is None or not len(edited):
+        return
+    picked = edited[edited["called"].astype(bool)]
+    store.set_squad(match_id, [int(n) for n in picked["player_num"]])
+    store.set_lineup(match_id, set_no, [
+        {
+            "player_num": int(row["player_num"]),
+            "player_name": row["player_name"],
+            "player_role": str(row["player_role"] or ""),
+        }
+        for row in picked.to_dict("records")
+    ])
+    store.restamp_roles(match_id, set_no)
 
 
 def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
@@ -985,14 +1025,8 @@ def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
         protocol_section(match, match_events)
 
     with right:
-        numbers = squad_section(roster, match)
-        with st.expander("Starting roles (set 1)"):
-            called = set(store.squad_numbers(match)) or set(numbers)
-            players = [
-                p for p in roster.sort_values("number").to_dict("records")
-                if int(p["number"]) in called
-            ]
-            role_editor(chosen, 1, players, key=f"roles::setup::{chosen}")
+        st.markdown("**Called up**")
+        squad_editor(roster, match)
         st.divider()
         st.button("↻ Refresh from Profixio", key="sync_profixio",
                   on_click=cb_sync_profixio, width="stretch")
@@ -1003,7 +1037,7 @@ def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
             st.button("Create match", key="create_match",
                       on_click=cb_new_match, width="stretch")
         st.button("Start entering →", key="start_entering", type="primary",
-                  width="stretch", on_click=cb_start_entering, args=(chosen, numbers))
+                  width="stretch", on_click=cb_start_entering, args=(chosen,))
 
 
 def official_comparison(match: dict, team_row, match_events: pd.DataFrame) -> None:
@@ -1116,7 +1150,7 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
         with st.expander(f"Roles · set {set_no}"):
             role_editor(
                 match_id, set_no,
-                store.squad_players(roster, match).to_dict("records"),
+                store.squad_players(roster, match, set_no).to_dict("records"),
                 key=f"roles::{match_id}::{set_no}",
             )
         st.divider()

@@ -5,6 +5,7 @@ actually clicks is the only way to catch session-state and callback mistakes.
 """
 
 import base64
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -26,6 +27,14 @@ def record(app, number, action, result):
     app.button(key=f"player::p{number}").click().run()
     app.button(key=f"action::{action}").click().run()
     app.button(key=f"result::{action}::{result}").click().run()
+    return app
+
+
+def squad_table(app, rows, match_id=None):
+    """Stand in for the squad data editor, which AppTest cannot click."""
+    app.session_state[f"squad_edit::{match_id or MATCH['match_id']}"] = pd.DataFrame(
+        rows, columns=["called", "player_num", "player_name", "player_role"]
+    )
     return app
 
 
@@ -220,7 +229,11 @@ def test_setup_blocks_the_workspace_until_confirmed(gated_app):
 
 
 def test_starting_entry_opens_the_workspace_and_saves_the_squad(gated_app):
-    gated_app.checkbox(key=f"squad::{MATCH['match_id']}::12").set_value(False).run()
+    squad_table(gated_app, [
+        (True, 4, "Cyd", "MB"),
+        (True, 7, "Ana", "OH"),
+        (False, 12, "Bea", "S"),
+    ])
     gated_app.button(key="start_entering").click().run()
     assert not gated_app.exception
 
@@ -231,11 +244,34 @@ def test_starting_entry_opens_the_workspace_and_saves_the_squad(gated_app):
 
 
 def test_the_squad_filters_the_player_grid(gated_app):
-    gated_app.checkbox(key=f"squad::{MATCH['match_id']}::12").set_value(False).run()
+    squad_table(gated_app, [
+        (True, 4, "Cyd", "MB"),
+        (True, 7, "Ana", "OH"),
+        (False, 12, "Bea", "S"),
+    ])
     gated_app.button(key="start_entering").click().run()
 
     keys = [b.key for b in gated_app.button if b.key.startswith("player::")]
     assert keys == ["player::p4", "player::p7"]
+
+
+def test_the_shirt_number_can_differ_from_the_roster(gated_app):
+    """Numbers belong to a match: Profixio reassigns them and shirts get lent."""
+    squad_table(gated_app, [(True, 77, "Ana", "OH")])
+    gated_app.button(key="start_entering").click().run()
+    assert not gated_app.exception
+
+    assert [b.label for b in gated_app.button if b.key.startswith("player::")] == ["#77 Ana"]
+    record(gated_app, 77, schema.ATTACK, "attempt")
+    row = store.load_events().iloc[-1]
+    assert int(row["player_num"]) == 77 and row["player_name"] == "Ana"
+
+
+def test_the_role_set_in_the_squad_table_reaches_the_events(gated_app):
+    squad_table(gated_app, [(True, 7, "Ana", "OP")])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.ATTACK, "attempt")
+    assert store.load_events().iloc[-1]["player_role"] == "OP"
 
 
 def test_the_official_result_is_shown_on_setup(gated_app):
@@ -289,7 +325,7 @@ def test_a_protocol_only_box_score_says_so(gated_app):
     assert not any("Official protocol only" in i.value for i in gated_app.info)
 
 
-# --- protocol and video must not double count -------------------------------
+# --- the protocol informs, it does not block ---------------------------------
 
 def import_jomala_protocol(match_id):
     from pathlib import Path
@@ -307,43 +343,58 @@ def import_jomala_protocol(match_id):
     return events
 
 
-def test_scoring_actions_are_locked_once_the_protocol_is_in(gated_app):
-    """Every point is already imported - recording a kill again would double it."""
+needs_protocol = pytest.mark.skipif(
+    not (Path(__file__).parent / "fixtures" / "a_32681384.pdf").exists(),
+    reason="Profixio recording is not in version control",
+)
+
+
+@needs_protocol
+def test_scoring_actions_stay_available_with_a_protocol_imported(gated_app):
+    """Not every match is scored carefully; a wrong point has to be fixable."""
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
     gated_app.button(key="player::p7").click().run()
     gated_app.button(key=f"action::{schema.ATTACK}").click().run()
 
-    kill = gated_app.button(key=f"result::{schema.ATTACK}::kill")
-    attempt = gated_app.button(key=f"result::{schema.ATTACK}::attempt")
-    assert kill.disabled is True
-    assert attempt.disabled is False
+    for result in schema.ACTIONS[schema.ATTACK]:
+        assert gated_app.button(key=f"result::{schema.ATTACK}::{result}").disabled is False
 
 
-def test_non_scoring_actions_stay_available(gated_app):
+@needs_protocol
+def test_a_manually_added_kill_is_recorded(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    before = len(store.load_events())
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.ATTACK, "kill")
+    assert not gated_app.exception
+
+    after = store.load_events()
+    assert len(after) == before + 1
+    added = after.iloc[-1]
+    assert added["action_result"] == "kill"
+    assert added["source"] == schema.SOURCE_MANUAL
+
+
+@needs_protocol
+def test_what_the_protocol_already_holds_is_shown(gated_app):
+    """Informational, so you can tell a correction from a duplicate."""
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
     gated_app.button(key="player::p7").click().run()
-    gated_app.button(key=f"action::{schema.RECEPTION}").click().run()
+    gated_app.button(key=f"action::{schema.SERVE}").click().run()
 
-    for result in schema.ACTIONS[schema.RECEPTION]:
-        assert gated_app.button(key=f"result::{schema.RECEPTION}::{result}").disabled is False
+    captions = " ".join(c.value for c in gated_app.caption)
+    assert "official protocol already has" in captions
+    assert "#7" in captions
 
 
-def test_the_override_reopens_scoring(gated_app):
-    import_jomala_protocol(MATCH["match_id"])
+def test_nothing_is_said_when_there_is_no_protocol(gated_app):
     gated_app.button(key="start_entering").click().run()
-    gated_app.toggle(key="allow_scoring").set_value(True).run()
+    gated_app.button(key="player::p7").click().run()
+    gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    assert not any("official protocol already has" in c.value for c in gated_app.caption)
 
-    before = len(store.load_events())
-    record(gated_app, 7, schema.ATTACK, "kill")
-    assert not gated_app.exception
-    assert len(store.load_events()) == before + 1
-
-
-def test_nothing_is_locked_without_a_protocol(gated_app):
-    """A match with no protocol imported behaves exactly as before."""
-    gated_app.button(key="start_entering").click().run()
     before = len(store.load_events())
     record(gated_app, 7, schema.ATTACK, "kill")
     assert len(store.load_events()) == before + 1
@@ -370,10 +421,11 @@ def test_roles_default_from_the_roster_and_carry_forward(gated_app):
 def test_events_are_stamped_with_the_role_of_that_set(gated_app):
     from volley import store as s
 
+    gated_app.button(key="start_entering").click().run()
     s.set_lineup(MATCH["match_id"], 1, [
         {"player_num": 7, "player_name": "Ana", "player_role": "S"},
     ])
-    gated_app.button(key="start_entering").click().run()
+    gated_app.run()
     record(gated_app, 7, schema.ATTACK, "attempt")
     assert not gated_app.exception
     assert s.load_events().iloc[-1]["player_role"] == "S"
@@ -382,10 +434,11 @@ def test_events_are_stamped_with_the_role_of_that_set(gated_app):
 def test_changing_a_role_restamps_events_already_recorded(gated_app):
     from volley import store as s
 
+    gated_app.button(key="start_entering").click().run()
     s.set_lineup(MATCH["match_id"], 1, [
         {"player_num": 7, "player_name": "Ana", "player_role": "S"},
     ])
-    gated_app.button(key="start_entering").click().run()
+    gated_app.run()
     record(gated_app, 7, schema.ATTACK, "attempt")
     assert s.load_events().iloc[-1]["player_role"] == "S"
 
@@ -526,9 +579,7 @@ def test_a_set_matching_the_official_score_is_marked_done(gated_app):
 def test_the_lineup_carries_into_the_next_set(gated_app):
     from volley import store as s
 
-    s.set_lineup(MATCH["match_id"], 1, [
-        {"player_num": 7, "player_name": "Ana", "player_role": "OP"},
-    ])
+    squad_table(gated_app, [(True, 7, "Ana", "OP")])
     gated_app.button(key="start_entering").click().run()
     gated_app.button(key="next_set").click().run()
     record(gated_app, 7, schema.ATTACK, "attempt")

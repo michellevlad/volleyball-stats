@@ -312,12 +312,53 @@ def test_merging_the_roster_preserves_position_and_active(temp_store, season_htm
     assert len(again) == 11
 
 
-def test_players_dropped_from_profixio_are_kept(temp_store, season_html):
+def test_players_dropped_from_profixio_are_kept_but_deactivated(temp_store, season_html):
     """Deleting them would orphan every event they appear in."""
     players = profixio.parse_roster(season_html)
     store.merge_profixio_roster(players)
     store.merge_profixio_roster(players[:3])
-    assert len(store.load_roster()) == 11
+
+    roster = store.load_roster()
+    assert len(roster) == 11
+    assert roster["active"].sum() == 3
+    # ...and they stay out of the default call-up.
+    assert len(store.active_players(roster)) == 3
+
+
+def test_a_changed_shirt_number_updates_the_player(temp_store):
+    """Numbers move between matches; the player is the same person."""
+    store.merge_profixio_roster([{"number": 99, "name": "Milena Jeczalik"}])
+    store.save_roster(store.load_roster().assign(position="MB"))
+
+    store.merge_profixio_roster([{"number": 31, "name": "Milena Jeczalik"}])
+    roster = store.load_roster()
+    assert len(roster) == 1
+    assert int(roster.iloc[0]["number"]) == 31
+    assert roster.iloc[0]["position"] == "MB"      # local edits survive
+
+
+def test_a_number_handed_to_someone_else_does_not_rename_anyone(temp_store):
+    """Luisa moved 4 -> 17 and Maryam took 4. Two players, not one renamed."""
+    store.merge_profixio_roster([{"number": 4, "name": "Luisa Velez Ledesma"}])
+    store.merge_profixio_roster([
+        {"number": 17, "name": "Luisa Velez Ledesma"},
+        {"number": 4, "name": "Maryam Al-saqa"},
+    ])
+    roster = store.load_roster()
+    by_name = {r["name"]: int(r["number"]) for r in roster.to_dict("records")}
+    assert by_name == {"Luisa Velez Ledesma": 17, "Maryam Al-saqa": 4}
+    assert len(roster) == 2
+
+
+def test_a_sync_never_overrides_your_own_active_flag(temp_store):
+    """Someone can be in the registered squad and still be injured."""
+    store.merge_profixio_roster([{"number": 18, "name": "Kira Zhukova"}])
+    roster = store.load_roster()
+    roster["active"] = False
+    store.save_roster(roster)
+
+    store.merge_profixio_roster([{"number": 18, "name": "Kira Zhukova"}])
+    assert bool(store.load_roster().iloc[0]["active"]) is False
 
 
 # --- the protocol download is behind a bot check ----------------------------
