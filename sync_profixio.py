@@ -48,7 +48,8 @@ def import_protocol(profixio_match_id: str, path=None) -> int:
     if not len(row):
         print(f"No local match with Profixio id {profixio_match_id}. Sync first.")
         return 0
-    match_id = row.iloc[0]["match_id"]
+    match = row.iloc[0].to_dict()
+    match_id = match["match_id"]
 
     if path is None:
         path = profixio.find_downloaded_protocol(profixio_match_id)
@@ -60,9 +61,10 @@ def import_protocol(profixio_match_id: str, path=None) -> int:
     protocol = profixio.parse_protocol(profixio.extract_pdf_text(pdf))
     summary = profixio.protocol_summary(protocol, settings["team_name"])
     events = profixio.protocol_to_events(
-        protocol, settings["team_name"], match_id, store.load_roster()
+        protocol, settings["team_name"], match, store.load_roster()
     )
     store.replace_profixio_events(match_id, events)
+    store.restamp_roles(match_id)
     print(f"  {match_id}: {summary['rows']} rows -> {len(events)} events, "
           f"{summary['points_for']}-{summary['points_against']} points, "
           f"result {summary['result']}")

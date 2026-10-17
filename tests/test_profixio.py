@@ -346,3 +346,22 @@ def test_team_url_shape():
     assert profixio.team_url("111", "222", "333") == (
         "https://www.profixio.com/app/leagueid111/teams/222?k=333"
     )
+
+
+# --- the command line uses the same call as the app -------------------------
+
+def test_the_sync_cli_passes_a_match_row_not_an_id(temp_store, protocol, monkeypatch):
+    """The CLI once passed the id and broke on the first import after a sync."""
+    import sync_profixio
+
+    store.upsert_match({**MATCH, "profixio_match_id": "32681384"})
+    monkeypatch.setattr(profixio, "find_downloaded_protocol", lambda *a, **k: "fake.pdf")
+    monkeypatch.setattr(profixio, "read_protocol_file", lambda path: b"%PDF")
+    monkeypatch.setattr(profixio, "extract_pdf_text", lambda data: "")
+    monkeypatch.setattr(profixio, "parse_protocol", lambda text: protocol)
+
+    assert sync_profixio.import_protocol("32681384") == 52
+    saved = store.load_events()
+    assert len(saved) == 52
+    assert set(saved["match_name"]) == {"Jomala IK C vs Elden VBK"}
+    assert set(saved["match_date"]) == {"2026-09-26"}
