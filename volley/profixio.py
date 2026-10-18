@@ -368,6 +368,11 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
     """
     match_id = match.get("match_id", "")
     we_are_home = protocol.get("home", "").strip() == team_name.strip()
+    # The whole protocol arrives at once, so every row shares one instant and
+    # `seq` is what orders them within it. That keeps an import together at the
+    # point in your history where you actually imported it, instead of looking
+    # like the newest thing you entered.
+    imported_at = store.now_stamp()
     # Matched by name, never by number. Shirt numbers are reassigned between
     # matches, so looking the roster up by number stamps whoever wears that
     # shirt *now* onto points scored by whoever wore it *then*.
@@ -416,6 +421,7 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             "seq": seq,
             "score_us": score_us,
             "score_them": score_them,
+            "recorded_at": imported_at,
         })
     return events
 

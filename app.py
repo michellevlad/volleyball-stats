@@ -57,6 +57,13 @@ def init_state() -> None:
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
+    # Rows written before events carried a registration stamp need one, or they
+    # would all sort together at the bottom. Runs once per session and does
+    # nothing at all once every row is stamped.
+    if not st.session_state.get("backfilled"):
+        store.backfill_recorded_at()
+        st.session_state["backfilled"] = True
+
 
 def flash(kind: str, message: str) -> None:
     st.session_state.flash = (kind, message)
@@ -88,7 +95,13 @@ def current_video_id() -> str | None:
 
 # --- recording --------------------------------------------------------------
 
-def commit(match: dict, player: dict, action: str, result: str, target_num=None) -> None:
+def record(match: dict, player: dict, action: str, result: str, target_num=None) -> dict:
+    """Move the score, write one event, and hand back the row that was written.
+
+    Separate from `commit` because an assist records two events and they have
+    to share one selection reset and one message. Each call re-reads the buffer
+    so a second event gets the next `seq` rather than colliding with the first.
+    """
     match_id = match["match_id"]
     set_no = int(st.session_state.set_no)
     us_key, them_key = score_keys(match_id, set_no)
@@ -116,12 +129,25 @@ def commit(match: dict, player: dict, action: str, result: str, target_num=None)
         target_num=target_num,
     )
     store.append_event(event)
+    return event
+
+
+def describe(event: dict) -> str:
+    to = f" → #{event['target_num']}" if event["target_num"] not in ("", None) else ""
+    return (f"#{event['player_num']} {event['player_name']} · "
+            f"{event['action'].lower()} {event['action_result']}{to}")
+
+
+def clear_selection() -> None:
     st.session_state.sel_action = None
     st.session_state.sel_result = None
     st.session_state.sel_player = None
-    to = f" → #{target_num}" if target_num else ""
-    flash("success",
-          f"#{event['player_num']} {event['player_name']} · {action.lower()} {result}{to}")
+
+
+def commit(match: dict, player: dict, action: str, result: str, target_num=None) -> None:
+    event = record(match, player, action, result, target_num)
+    clear_selection()
+    flash("success", describe(event))
 
 
 # --- callbacks (run before the script reruns) ------------------------------
@@ -150,15 +176,26 @@ def cb_pick_player(match: dict, player: dict) -> None:
 
 
 def cb_pick_target(match: dict, target: dict) -> None:
-    player = st.session_state.sel_player
-    if player:
-        commit(match, player, schema.SET, "assist", target_num=int(target["number"]))
+    """The setter's assist and the hitter's kill, from the one tap.
+
+    An assist is by definition a set that ended in a kill, so the kill is
+    recorded too rather than asked for a second time. The protocol may already
+    hold that kill; recording it anyway is deliberate, because the point of
+    entering by hand is to complete what Profixio missed. A genuine double is
+    settled once in Review duplicates, which now remembers what you decided.
+    """
+    setter = st.session_state.sel_player
+    if not setter:
+        return
+    assist = record(match, setter, schema.SET, "assist",
+                    target_num=int(target["number"]))
+    kill = record(match, target, schema.ATTACK, "kill")
+    clear_selection()
+    flash("success", f"{describe(assist)}  ·  {describe(kill)}")
 
 
 def cb_clear_selection() -> None:
-    st.session_state.sel_action = None
-    st.session_state.sel_result = None
-    st.session_state.sel_player = None
+    clear_selection()
 
 
 def cb_goto_set(set_no: int) -> None:
@@ -768,12 +805,16 @@ def recent_events(match_events: pd.DataFrame) -> None:
         )
 
 
-def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
+def full_editor(match_events: pd.DataFrame, match_id: str) -> None:
     with st.expander(f"Edit all {len(match_events)} events of this match"):
         if not len(match_events):
             st.caption("Nothing to edit.")
             return
-        display = match_events[schema.EVENT_COLUMNS].iloc[::-1].copy()
+        # Newest first, in the order you registered them - the same order as
+        # Recent above, so the thing you just got wrong is the first row of
+        # both. Not (set, seq): seq restarts every set, so that would bury
+        # tonight's work under set 1. `recorded_at` is not shown; it only sorts.
+        display = store.newest_first(match_events, match_id)[schema.EVENT_COLUMNS].copy()
         editable = ["set_no", "seq", "player_num", "action", "action_result"]
         all_results = sorted({r for results in schema.ACTIONS.values() for r in results})
         edited = st.data_editor(
@@ -789,11 +830,17 @@ def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str)
             },
             key=f"editor::{match_id}",
         )
+        # Stashed for the callback, the way the squad and duplicate editors do
+        # it: a callback runs before the rerun, so it sees what was on screen
+        # when the button was pressed rather than a freshly rendered table.
+        st.session_state[f"editor_edit::{match_id}"] = edited
         col_save, col_download = st.columns(2)
-        if col_save.button("Save edits", key="save_edits", width="stretch"):
-            save_edits(edited, roster, match_id)
+        col_save.button("Save edits", key="save_edits", width="stretch",
+                        on_click=cb_save_edits, args=(match_id,))
         col_download.download_button(
             "Download this match (CSV)",
+            # Deliberately the other way round: a log you read elsewhere runs
+            # forwards through the match, set 1 first.
             match_events[schema.EVENT_COLUMNS].to_csv(index=False),
             file_name=f"{match_id}.csv",
             mime="text/csv",
@@ -801,8 +848,26 @@ def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str)
         )
 
 
-def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
-    """Re-validate every edited row, then write the whole match back to the buffer."""
+# What a row claims happened. Change any of it and a previous "yes, keep this"
+# was about a different row, so the review decision is withdrawn.
+CLAIM = ("set_no", "player_num", "action", "action_result")
+
+
+def cb_save_edits(match_id: str) -> None:
+    edited = st.session_state.get(f"editor_edit::{match_id}")
+    if edited is None or not len(edited):
+        return
+    save_edits(edited, match_id)
+
+
+def save_edits(edited: pd.DataFrame, match_id: str) -> None:
+    """Re-validate the edited rows and write back the ones that actually changed.
+
+    The name is resolved from the match line-up, never from the roster. The
+    roster is current; the line-up is the record of who wore which shirt on the
+    day. Looking a number up in the roster is how points scored by #4 Luisa in
+    September came back stamped with the name of whoever wears #4 now.
+    """
     problems = []
     rows = []
     for position, row in enumerate(edited.to_dict("records"), start=1):
@@ -811,9 +876,11 @@ def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> Non
         except schema.InvalidEvent as exc:
             problems.append(f"row {position}: {exc}")
             continue
-        player = store.find_by_number(roster, row["player_num"])
-        if player is not None:
-            row["player_name"] = player["name"]
+        # Resolve against the row's own set, which is itself editable. A number
+        # the line-up does not mention keeps the name it already carries rather
+        # than being blanked or guessed at.
+        names = store.names_for_set(match_id, int(row["set_no"]))
+        row["player_name"] = names.get(int(row["player_num"]), row["player_name"])
         row["action"], row["action_result"] = action, result
         row["is_point"] = schema.is_point(action, result)
         rows.append(row)
@@ -823,13 +890,29 @@ def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> Non
         return
 
     events = store.load_events()
-    edited_ids = {row["event_id"] for row in rows}
-    updated = pd.DataFrame(rows)
-    updated["synced"] = False   # edited rows need re-pushing
-    events = store.concat_frames([events[~events["event_id"].isin(edited_ids)], updated])
+    before = events.set_index("event_id")
+    changed = []
+    for row in rows:
+        was = before.loc[row["event_id"]] if row["event_id"] in before.index else None
+        if was is None:
+            continue
+        fields = ["player_name", "is_point"] + list(CLAIM)
+        if all(str(was[field]) == str(row[field]) for field in fields):
+            continue   # untouched: leave its synced and reviewed flags alone
+        row["synced"] = False   # edited rows need re-pushing
+        if any(str(was[field]) != str(row[field]) for field in CLAIM):
+            row["reviewed"] = False
+        changed.append(row)
+
+    if not changed:
+        flash("success", "No changes to save.")
+        return
+
+    updated = pd.DataFrame(changed)
+    changed_ids = set(updated["event_id"])
+    events = store.concat_frames([events[~events["event_id"].isin(changed_ids)], updated])
     store.save_events(events)
-    flash("success", f"Saved {len(rows)} event(s)")
-    st.rerun()
+    flash("success", f"Saved {len(changed)} event(s)")
 
 
 # --- match setup ------------------------------------------------------------
@@ -1005,15 +1088,39 @@ def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: d
 
 
 def cb_apply_duplicates(match_id: str, set_no: int) -> None:
+    """Remove what was unticked, and remember everything that was kept.
+
+    Recording the decision is the point. Deleting used to be the only thing
+    that stuck, so a correction you chose to keep was offered for deletion
+    again on the next rerun, and again after that.
+    """
     edited = st.session_state.get(f"dupes_edit::{match_id}::{set_no}")
     if edited is None or not len(edited):
         return
-    dropping = edited[~edited["keep"].astype(bool)]["event_id"]
+    keeping = edited["keep"].astype(bool)
+    dropping = edited[~keeping]["event_id"]
+    store.mark_reviewed(edited[keeping]["event_id"])
     if not len(dropping):
-        flash("success", "Nothing unticked - nothing removed.")
+        flash("success", f"Set {set_no} reviewed - nothing unticked, nothing removed.")
         return
     store.drop_events(dropping)
-    flash("success", f"Removed {len(dropping)} event(s) from set {set_no}.")
+    flash("success",
+          f"Removed {len(dropping)} event(s) from set {set_no}; "
+          f"kept {int(keeping.sum())}.")
+
+
+def dupe_note(row) -> str:
+    """One sentence about a row, saying the same thing on every row of a group.
+
+    It used to read "the other source has 4" on your row and "the other source
+    has 6" on the protocol's, which are two true statements that look like a
+    contradiction. Both totals, stated the same way, is one fact you can act on.
+    """
+    if row["reviewed"]:
+        return "✓ kept on review"
+    if row["source"] == schema.SOURCE_MANUAL and not row["matches"]:
+        return "protocol has none - looks like a correction"
+    return f"protocol {int(row['n_protocol'])} · you {int(row['n_manual'])}"
 
 
 def review_duplicates(match: dict) -> None:
@@ -1043,10 +1150,7 @@ def review_duplicates(match: dict) -> None:
             "action": f"{row['action'].lower()} {row['action_result']}",
             "score": (f"{int(row['score_us'])}-{int(row['score_them'])}"
                       if row["source"] == schema.SOURCE_PROFIXIO else ""),
-            "note": ("protocol has none - looks like a correction"
-                     if row["source"] == schema.SOURCE_MANUAL and not row["matches"]
-                     else f"the other source has {int(row['matches'])}"
-                     if row["matches"] else ""),
+            "note": dupe_note(row),
             "event_id": row["event_id"],
         }
         for row in candidates.to_dict("records")
@@ -1070,15 +1174,22 @@ def review_duplicates(match: dict) -> None:
     st.session_state[f"dupes_edit::{match_id}::{set_no}"] = edited
 
     dropping = int((~edited["keep"].astype(bool)).sum())
+    settled = int(candidates["reviewed"].astype(bool).sum())
+    already = f" {settled} already reviewed." if settled else ""
     st.caption(
-        f"{len(edited)} point-scoring events in set {set_no}. "
-        f"Apply would remove {dropping}. Receptions, digs, attempts, errors and "
-        "sets are never shown here and are never touched."
+        f"{len(edited)} point-scoring events in set {set_no}.{already} "
+        f"Apply would remove {dropping} and mark the rest reviewed, so they "
+        "stop coming back. Receptions, digs, attempts, errors and sets are "
+        "never shown here and are never touched."
     )
+    unsettled = int((~candidates["reviewed"].astype(bool)).sum())
     st.button(
         f"Apply — remove {dropping}", key=f"dupes_apply::{match_id}::{set_no}",
         on_click=cb_apply_duplicates, args=(match_id, int(set_no)),
-        width="stretch", disabled=dropping == 0,
+        width="stretch",
+        # Enabled with nothing to remove, because Apply is also how you say
+        # "these are all fine" and stop being asked.
+        disabled=dropping == 0 and unsettled == 0,
     )
 
 
@@ -1393,7 +1504,7 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
     with right:
         recent_events(store.newest_first(events, match_id, limit=12))
 
-    full_editor(match_events, roster, match_id)
+    full_editor(match_events, match_id)
 
 
 # --- page -------------------------------------------------------------------

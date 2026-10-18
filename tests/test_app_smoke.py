@@ -901,3 +901,223 @@ def test_there_is_only_one_set_control(gated_app):
     gated_app.button(key="start_entering").click().run()
     assert not [r for r in gated_app.radio if r.key == "set_no"]
     assert len([b for b in gated_app.button if b.key.startswith("goto_set::")]) == 5
+
+
+# --- the line-up owns the name, not the roster ------------------------------
+
+def editor_rows(app, match_id=None):
+    """Stand in for the event data editor, which AppTest cannot click."""
+    match_id = match_id or MATCH["match_id"]
+    return store.match_events(store.load_events(), match_id)[schema.EVENT_COLUMNS].copy()
+
+
+def save_editor(app, frame, match_id=None):
+    """Seed the editor's stash and press Save.
+
+    Run first so the button exists for events seeded since the last render,
+    then overwrite the stash: the callback reads it before the next rerun.
+    """
+    match_id = match_id or MATCH["match_id"]
+    app.run()
+    app.session_state[f"editor_edit::{match_id}"] = frame
+    app.button(key="save_edits").click().run()
+    return app
+
+
+def test_saving_edits_keeps_the_lineup_name_not_the_rosters(app):
+    """#4 was Luisa that day; the roster has since given #4 to someone else.
+
+    Saving used to look the name up in the roster by number, so every point
+    Luisa scored came back stamped with the current holder of her old shirt.
+    """
+    match_id = MATCH["match_id"]
+    store.save_roster(pd.DataFrame([
+        {"player_id": "", "number": 4, "name": "Maryam", "position": "S", "active": True},
+        {"player_id": "", "number": 17, "name": "Luisa", "position": "S", "active": True},
+    ]))
+    store.set_lineup(match_id, 1, [
+        {"player_num": 4, "player_name": "Luisa", "player_role": "S"}])
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 4, "name": "Luisa"},
+        action=schema.SERVE, result="ace",
+    ))
+
+    save_editor(app, editor_rows(app))
+    assert not app.exception
+    assert list(store.load_events()["player_name"]) == ["Luisa"]
+
+
+def test_changing_the_number_re_resolves_the_name_from_the_lineup(app):
+    match_id = MATCH["match_id"]
+    store.set_lineup(match_id, 1, [
+        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"},
+    ])
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 4, "name": "Luisa"},
+        action=schema.ATTACK, result="kill",
+    ))
+
+    frame = editor_rows(app)
+    frame.loc[frame.index[0], "player_num"] = 7     # it was Ana's kill
+    save_editor(app, frame)
+
+    assert not app.exception
+    saved = store.load_events().iloc[0]
+    assert saved["player_num"] == 7
+    assert saved["player_name"] == "Ana"
+
+
+def test_a_number_the_lineup_does_not_know_keeps_its_name(app):
+    """Better a name that is merely old than one that is confidently wrong."""
+    store.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"}])
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 23, "name": "Guest"},
+        action=schema.DIG, result="dig",
+    ))
+
+    save_editor(app, editor_rows(app))
+    assert store.load_events().iloc[0]["player_name"] == "Guest"
+
+
+def test_saving_leaves_untouched_rows_alone(app):
+    """Saving used to rewrite the whole match and mark all of it unpushed."""
+    store.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"}])
+    for seq, result in enumerate(["ace", "in"], start=1):
+        store.append_event(store.build_event(
+            match=MATCH, set_no=1, seq=seq,
+            player={"number": 7, "name": "Ana"},
+            action=schema.SERVE, result=result,
+        ))
+    store.mark_synced(store.load_events()["event_id"])
+
+    frame = editor_rows(app)
+    frame.loc[frame.index[0], "action_result"] = "error"
+    save_editor(app, frame)
+
+    saved = store.load_events().set_index("event_id")
+    changed = saved[saved["action_result"] == "error"].iloc[0]
+    untouched = saved[saved["action_result"] == "in"].iloc[0]
+    assert bool(changed["synced"]) is False       # needs re-pushing
+    assert bool(untouched["synced"]) is True      # was never edited
+
+
+def test_editing_what_a_row_claims_withdraws_its_review(app):
+    store.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"}])
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 7, "name": "Ana"},
+        action=schema.SERVE, result="ace",
+    ))
+    store.mark_reviewed(store.load_events()["event_id"])
+
+    frame = editor_rows(app)
+    frame.loc[frame.index[0], "action_result"] = "in"
+    save_editor(app, frame)
+
+    assert bool(store.load_events().iloc[0]["reviewed"]) is False
+
+
+# --- an assist is a set that ended in a kill --------------------------------
+
+def test_an_assist_records_the_hitters_kill_too(app):
+    record(app, 12, schema.SET, "assist", target=7)
+    assert not app.exception
+
+    events = store.load_events()
+    assert len(events) == 2
+
+    assist = events[events["action"] == schema.SET].iloc[0]
+    kill = events[events["action"] == schema.ATTACK].iloc[0]
+    assert assist["player_num"] == 12 and assist["action_result"] == "assist"
+    assert int(assist["target_num"]) == 7
+    assert kill["player_num"] == 7 and kill["action_result"] == "kill"
+    assert bool(kill["is_point"]) is True
+    assert bool(assist["is_point"]) is False
+    # The second event must not reuse the first one's number.
+    assert assist["seq"] != kill["seq"]
+
+
+def test_the_assists_kill_moves_the_score_once(app):
+    """One point for the rally, not two, and none for the assist."""
+    record(app, 12, schema.SET, "assist", target=7)
+    us, them = store.current_score(store.load_events(), MATCH["match_id"], 1)
+    assert (us, them) == (1, 0)
+
+
+def test_a_plain_kill_still_writes_one_event(app):
+    record(app, 7, schema.ATTACK, "kill")
+    assert len(store.load_events()) == 1
+
+
+# --- review duplicates remembers what you decided ---------------------------
+
+@needs_protocol
+def test_a_kept_row_stays_kept_on_the_next_look(gated_app):
+    """The trap: corrections you deliberately kept came back for deletion."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SERVE, "ace")        # the protocol has these
+    gated_app.button(key="reopen_setup").click().run()
+
+    mine = store.duplicate_candidates(MATCH["match_id"], 1)
+    mine = mine[mine["source"] == schema.SOURCE_MANUAL]
+    assert bool(mine.iloc[0]["keep"]) is False       # unticked, as a guess
+
+    # Say "no, that one is real" and apply.
+    stash = gated_app.session_state[f"dupes_edit::{MATCH['match_id']}::1"].copy()
+    stash["keep"] = True
+    gated_app.session_state[f"dupes_edit::{MATCH['match_id']}::1"] = stash
+    gated_app.button(key=f"dupes_apply::{MATCH['match_id']}::1").click().run()
+    assert not gated_app.exception
+
+    again = store.duplicate_candidates(MATCH["match_id"], 1)
+    again = again[again["source"] == schema.SOURCE_MANUAL]
+    assert len(again) == 1                           # still there
+    assert bool(again.iloc[0]["keep"]) is True       # and still ticked
+    assert bool(again.iloc[0]["reviewed"]) is True
+
+
+@needs_protocol
+def test_applying_marks_what_it_kept_as_reviewed(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 12, schema.SERVE, "ace")       # a correction, kept
+    gated_app.button(key="reopen_setup").click().run()
+    gated_app.button(key=f"dupes_apply::{MATCH['match_id']}::1").click().run()
+
+    events = store.load_events()
+    kept = events[(events["source"] == schema.SOURCE_MANUAL)
+                  & (events["action"] == schema.SERVE)]
+    assert len(kept) == 1
+    assert bool(kept.iloc[0]["reviewed"]) is True
+    # The protocol's own rows are settled too.
+    protocol = events[events["source"] == schema.SOURCE_PROFIXIO]
+    assert bool(protocol[protocol["set_no"] == 1]["reviewed"].all())
+
+
+@needs_protocol
+def test_a_new_event_after_a_review_is_unreviewed(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SERVE, "ace")
+    gated_app.button(key="reopen_setup").click().run()
+    stash = gated_app.session_state[f"dupes_edit::{MATCH['match_id']}::1"].copy()
+    stash["keep"] = True                             # keep it, deliberately
+    gated_app.session_state[f"dupes_edit::{MATCH['match_id']}::1"] = stash
+    gated_app.button(key=f"dupes_apply::{MATCH['match_id']}::1").click().run()
+
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SERVE, "ace")        # one more, later
+
+    mine = store.duplicate_candidates(MATCH["match_id"], 1)
+    mine = mine[mine["source"] == schema.SOURCE_MANUAL]
+    # The settled one stays settled; only the new one is asked about.
+    assert sorted(bool(v) for v in mine["reviewed"]) == [False, True]
+    assert sorted(bool(v) for v in mine["keep"]) == [False, True]

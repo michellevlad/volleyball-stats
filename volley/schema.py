@@ -174,8 +174,17 @@ EVENT_COLUMNS = [
 SOURCE_MANUAL = "manual"
 SOURCE_PROFIXIO = "profixio"
 
-# Local-only bookkeeping column, never written to the spreadsheet.
-LOCAL_ONLY_COLUMNS = ["synced"]
+# Local-only bookkeeping, never written to the spreadsheet.
+#
+# `recorded_at` is when the row was entered here, not anything about the match.
+# It exists because `seq` restarts at 1 in every set and so cannot order a
+# match, and because the buffer is rewritten often enough that row order is not
+# a reliable stand-in. It decides what "newest" means and is never displayed.
+#
+# `reviewed` is "I have looked at this in Review duplicates and decided".
+# Without it the panel recomputes its guess every rerun and keeps offering to
+# delete the corrections you deliberately kept.
+LOCAL_ONLY_COLUMNS = ["synced", "recorded_at", "reviewed"]
 
 # Keyed by shirt number: it is unique within a match, and it is what you see
 # on the court.

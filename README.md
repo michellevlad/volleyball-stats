@@ -79,6 +79,11 @@ The action row is first because it never changes — your hand goes to the same 
 The player row comes last, by which point you already know the name. A **set assist** is the one
 exception: it asks a fourth time, for who it was set to.
 
+That fourth tap records **two** events — the setter's assist and the hitter's kill — because an
+assist is by definition a set that ended in a kill, and asking you to tap the same rally twice is
+how points get missed. If the official protocol already has that kill you now have it twice; that
+is deliberate, and **Review duplicates** is where you settle it, once.
+
 Click the video once, then YouTube's own shortcuts work:
 
 | key | what it does |
@@ -156,7 +161,7 @@ is strong; below 2.0 means their serve is dictating the match.
 
 | Result | What happened | Effect |
 |---|---|---|
-| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Nothing directly |
+| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Records the hitter's kill too; a point for us |
 | **set (0)** | A set that didn't lead to a point. | Nothing |
 | **error** | A ball-handling fault (double contact, lift) or a set so bad it can't be played. | Point for them |
 
@@ -225,7 +230,14 @@ opponent error, **+1 them** for their points, and you can always type over the n
 ## Fixing mistakes
 
 - **✕** next to any recent event removes it.
-- **Edit all events** opens the whole match in a table you can edit like a spreadsheet.
+- **Edit all events** opens the whole match in a table you can edit like a spreadsheet, **newest
+  first** — the same order as Recent, so whatever you just got wrong is the top row of both. That
+  is the order you *registered* things in, not set-and-rally order: sets don't finish in the order
+  you track them, and the last thing you typed is the thing you want to reach.
+- **Names come from the line-up, never from the roster.** The roster is current; the line-up is who
+  wore which shirt *that day*. Shirt numbers get reassigned between matches, so a name looked up by
+  number in the roster puts tonight's #4 on the points scored by last month's #4. If a name is wrong
+  on an event, fix it in **Roles** for that set and every event of that set follows.
 - **Official vs entered** under the box score checks **each set separately** against Profixio, so
   you can confirm a set the moment you finish it rather than discovering at the end of the match
   that one went in under the wrong number:
@@ -238,6 +250,23 @@ opponent error, **+1 them** for their points, and you can always type over the n
   | Result | 3-0 | 2-0 | ⚠️ |
 - Re-importing the protocol is always safe: it replaces only the imported rows and never touches
   anything you entered from the video.
+
+### Review duplicates
+
+The protocol owns the points. If you also tapped an ace the scoresheet already had, the set now
+holds it twice and the player looks twice as productive. **Review duplicates** lists the
+point-scoring events of one set — aces, kills and block points, the only three a protocol records —
+with both sources side by side. Receptions, digs, attempts, errors and sets can never collide with
+a protocol, so they are never shown and never touched.
+
+Each row says what both sides hold: `protocol 4 · you 2`. The guess is that a row the protocol also
+has is a re-entry, and a row it has nothing like is a correction — because **the scoresheet is
+sometimes wrong**, and "Milena had 10 aces, not 7" has to be recordable.
+
+**Apply is how you record a decision, not just how you delete.** It removes what you unticked and
+marks everything you kept as reviewed, so it is never questioned again — a kept row comes back
+marked `✓ kept on review`. Press Apply even when there is nothing to remove; that is how you say
+"these are all fine" and stop being asked. Add new events later and only *those* are asked about.
 
 ---
 
