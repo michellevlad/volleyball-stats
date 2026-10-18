@@ -197,6 +197,17 @@ def match_events(events: pd.DataFrame, match_id: str) -> pd.DataFrame:
     return events[events["match_id"] == match_id].sort_values(["set_no", "seq"])
 
 
+def newest_first(events: pd.DataFrame, match_id: str, limit: int = None) -> pd.DataFrame:
+    """Most recently registered first.
+
+    The buffer is append-only, so row order *is* the order things were entered -
+    which is not the same as set and sequence order once you move between sets.
+    What you just did should be the first thing you see.
+    """
+    rows = events[events["match_id"] == match_id].iloc[::-1]
+    return rows.head(limit) if limit else rows
+
+
 def current_score(events: pd.DataFrame, match_id: str, set_no: int) -> tuple[int, int]:
     """Score after the last event of a set, used to restore state on reload."""
     rows = events[(events["match_id"] == match_id) & (events["set_no"] == int(set_no))]

@@ -40,13 +40,17 @@ python3 -m venv .venv                      # a private space for the app's code
 .venv/bin/python sync_profixio.py          # pull the season from Profixio
 ```
 
-From then on, the only command you need is:
+From then on, **double-click `Volleyball Stats` on the Desktop.** It starts the app if it is not
+already running and opens it in your browser. Launching it twice just reopens the tab.
+
+The equivalent from Terminal, if you prefer:
 
 ```bash
 .venv/bin/streamlit run app.py
 ```
 
-It opens in your browser at <http://localhost:8501>. Press `Ctrl-C` in Terminal to stop it.
+Either way it is at <http://localhost:8501>. To stop it: `Ctrl-C` in Terminal, or
+`pkill -f "streamlit run app.py"`. The launcher writes its output to `data/app.log`.
 
 ---
 
@@ -68,8 +72,12 @@ This is the screen you land on. Nothing can be entered until you have been throu
 
 ### 2. Watching the video
 
-The video sits across the top. Underneath it are the buttons: **tap the player, tap the action,
-tap the result.** Three taps and it is recorded.
+The video sits across the top. Underneath it are the buttons: **tap the action, tap the result,
+tap the player.** Three taps and it is recorded.
+
+The action row is first because it never changes — your hand goes to the same place every time.
+The player row comes last, by which point you already know the name. A **set assist** is the one
+exception: it asks a fourth time, for who it was set to.
 
 Click the video once, then YouTube's own shortcuts work:
 

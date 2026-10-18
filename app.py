@@ -311,8 +311,14 @@ def sidebar_connection() -> None:
             "unknown columns are left alone \u2014 nothing here is ever rewritten."
         )
         titles = st.session_state.tab_titles
-        chosen = {}
-        for role, default_title in schema.MAPPABLE_ROLES.items():
+        chosen = dict(st.session_state.mapping)
+        # Only the tabs a push actually writes can be mapped; the rest would be
+        # a choice with no effect.
+        writable = {
+            role: title for role, title in schema.MAPPABLE_ROLES.items()
+            if title in config.push_tabs()
+        }
+        for role, default_title in writable.items():
             options = list(titles)
             new_option = f"\u2795 create \u201c{default_title}\u201d"
             if default_title not in options:
@@ -499,8 +505,10 @@ def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
         theirs = official_by_set.get(number)
         if mine and theirs and mine == theirs:
             label = f"Set {number} ✅"
+        elif mine and theirs:
+            label = f"Set {number} · {mine} vs {theirs}"
         elif mine:
-            label = f"Set {number} ·"
+            label = f"Set {number} · {mine}"
         else:
             label = f"Set {number}"
         columns[index].button(
@@ -524,7 +532,8 @@ def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
         width="stretch",
         disabled=set_no >= 5,
         type="primary" if matches_official else "secondary",
-        help="Start entering the next set. The line-up carries over.",
+        help="Nothing marks a set finished - it shows ✅ once what you entered "
+             "matches the official score. The line-up carries over.",
     )
     if matches_official:
         st.caption(f"Set {set_no} matches the official {theirs} — ready for the next one.")
@@ -716,12 +725,12 @@ def box_score(match_events: pd.DataFrame, matches: pd.DataFrame, match: dict) ->
 
 
 def recent_events(match_events: pd.DataFrame) -> None:
+    """The last dozen, newest first - what you just did is at the top."""
     st.subheader("Recent")
     if not len(match_events):
         st.caption("Nothing entered yet.")
         return
-    ordered = match_events.sort_values(["set_no", "seq"]).tail(12).iloc[::-1]
-    for event in ordered.to_dict("records"):
+    for event in match_events.to_dict("records"):
         line, undo = st.columns([7, 1])
         line.write(
             f"S{event['set_no']} · #{event['player_num']} {event['player_name']} · "
@@ -738,7 +747,7 @@ def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str)
         if not len(match_events):
             st.caption("Nothing to edit.")
             return
-        display = match_events[schema.EVENT_COLUMNS].copy()
+        display = match_events[schema.EVENT_COLUMNS].iloc[::-1].copy()
         editable = ["set_no", "seq", "player_num", "action", "action_result"]
         all_results = sorted({r for results in schema.ACTIONS.values() for r in results})
         edited = st.data_editor(
@@ -968,6 +977,84 @@ def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: d
         store.set_lineup(match_id, set_no, rows)
 
 
+def cb_apply_duplicates(match_id: str, set_no: int) -> None:
+    edited = st.session_state.get(f"dupes_edit::{match_id}::{set_no}")
+    if edited is None or not len(edited):
+        return
+    dropping = edited[~edited["keep"].astype(bool)]["event_id"]
+    if not len(dropping):
+        flash("success", "Nothing unticked - nothing removed.")
+        return
+    store.drop_events(dropping)
+    flash("success", f"Removed {len(dropping)} event(s) from set {set_no}.")
+
+
+def review_duplicates(match: dict) -> None:
+    """Point-scoring events a set holds twice: once officially, once by hand.
+
+    Only these can be duplicates - the protocol records nothing else, so a
+    reception or a dig can never collide with it and is never shown here.
+    Nothing is removed until Apply, and every row is yours to tick.
+    """
+    match_id = match["match_id"]
+    st.markdown("**Review duplicates**")
+    if not store.has_profixio_events(match_id):
+        st.caption("No official protocol imported, so nothing can be a duplicate.")
+        return
+
+    set_no = st.selectbox("Set", [1, 2, 3, 4, 5], key=f"dupes_set::{match_id}")
+    candidates = store.duplicate_candidates(match_id, int(set_no))
+    if not len(candidates):
+        st.caption(f"Set {set_no} has no point-scoring events to compare.")
+        return
+
+    frame = pd.DataFrame([
+        {
+            "keep": bool(row["keep"]),
+            "source": "protocol" if row["source"] == schema.SOURCE_PROFIXIO else "you",
+            "player": f"#{int(row['player_num'])} {row['player_name']}",
+            "action": f"{row['action'].lower()} {row['action_result']}",
+            "score": (f"{int(row['score_us'])}-{int(row['score_them'])}"
+                      if row["source"] == schema.SOURCE_PROFIXIO else ""),
+            "note": ("protocol has none - looks like a correction"
+                     if row["source"] == schema.SOURCE_MANUAL and not row["matches"]
+                     else f"the other source has {int(row['matches'])}"
+                     if row["matches"] else ""),
+            "event_id": row["event_id"],
+        }
+        for row in candidates.to_dict("records")
+    ])
+
+    edited = st.data_editor(
+        frame,
+        key=f"dupes::{match_id}::{set_no}",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "keep": st.column_config.CheckboxColumn("keep", width="small"),
+            "source": st.column_config.TextColumn("from", disabled=True),
+            "player": st.column_config.TextColumn("player", disabled=True),
+            "action": st.column_config.TextColumn("action", disabled=True),
+            "score": st.column_config.TextColumn("at", disabled=True),
+            "note": st.column_config.TextColumn("note", disabled=True),
+            "event_id": None,
+        },
+    )
+    st.session_state[f"dupes_edit::{match_id}::{set_no}"] = edited
+
+    dropping = int((~edited["keep"].astype(bool)).sum())
+    st.caption(
+        f"{len(edited)} point-scoring events in set {set_no}. "
+        f"Apply would remove {dropping}. Receptions, digs, attempts, errors and "
+        "sets are never shown here and are never touched."
+    )
+    st.button(
+        f"Apply — remove {dropping}", key=f"dupes_apply::{match_id}::{set_no}",
+        on_click=cb_apply_duplicates, args=(match_id, int(set_no)),
+        width="stretch", disabled=dropping == 0,
+    )
+
+
 def squad_editor(roster: pd.DataFrame, match: dict, set_no: int = 1) -> None:
     """Who is playing, wearing what, in which role - one table.
 
@@ -1101,6 +1188,8 @@ def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
                   on_click=cb_save_video_url, args=(match,), width="stretch")
         st.divider()
         protocol_section(match, match_events)
+        st.divider()
+        review_duplicates(match)
 
     with right:
         st.markdown("**Called up**")
@@ -1261,7 +1350,7 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
         box_score(match_events, matches, match)
 
     with right:
-        recent_events(match_events)
+        recent_events(store.newest_first(events, match_id, limit=12))
 
     full_editor(match_events, roster, match_id)
 

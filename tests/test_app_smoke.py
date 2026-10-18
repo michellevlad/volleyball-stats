@@ -833,3 +833,72 @@ def test_the_action_row_is_always_in_the_same_place(gated_app):
     record(gated_app, 7, schema.DIG, "dig")
     after = [b.key for b in gated_app.button if b.key.startswith("action::")]
     assert after == first
+
+
+# --- review duplicates ------------------------------------------------------
+
+@needs_protocol
+def test_only_point_scoring_events_are_ever_reviewed(gated_app):
+    """A reception cannot collide with a protocol, so it is never at risk."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    for action, result in ((schema.RECEPTION, "perfect"), (schema.DIG, "dig"),
+                           (schema.ATTACK, "attempt"), (schema.ATTACK, "kill")):
+        record(gated_app, 7, action, result)
+
+    candidates = store.duplicate_candidates(MATCH["match_id"], 1)
+    kinds = {(r["action"], r["action_result"]) for r in candidates.to_dict("records")}
+    assert (schema.RECEPTION, "perfect") not in kinds
+    assert (schema.DIG, "dig") not in kinds
+    assert (schema.ATTACK, "attempt") not in kinds
+    assert (schema.ATTACK, "kill") in kinds
+
+
+@needs_protocol
+def test_a_duplicate_is_unticked_and_a_correction_is_kept(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    # #7 has protocol serve aces; #12 has nothing at all.
+    record(gated_app, 7, schema.SERVE, "ace")
+    record(gated_app, 12, schema.SERVE, "ace")
+
+    rows = store.duplicate_candidates(MATCH["match_id"], 1)
+    mine = rows[rows["source"] == schema.SOURCE_MANUAL]
+    duplicate = mine[mine["player_num"] == 7].iloc[0]
+    correction = mine[mine["player_num"] == 12].iloc[0]
+    assert bool(duplicate["keep"]) is False      # the protocol already has these
+    assert bool(correction["keep"]) is True      # nothing official to clash with
+    assert all(rows[rows["source"] == schema.SOURCE_PROFIXIO]["keep"])
+
+
+@needs_protocol
+def test_applying_removes_only_the_unticked_rows(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SERVE, "ace")        # a duplicate
+    record(gated_app, 7, schema.RECEPTION, "perfect")  # never at risk
+    before = len(store.load_events())
+
+    gated_app.button(key="reopen_setup").click().run()
+    apply_key = f"dupes_apply::{MATCH['match_id']}::1"
+    gated_app.button(key=apply_key).click().run()
+    assert not gated_app.exception
+
+    after = store.load_events()
+    assert len(after) == before - 1
+    # The reception is still there; the duplicated ace is gone.
+    assert len(after[after["action"] == schema.RECEPTION]) == 1
+    manual_aces = after[(after["source"] == schema.SOURCE_MANUAL)
+                        & (after["action"] == schema.SERVE)]
+    assert len(manual_aces) == 0
+
+
+@needs_protocol
+def test_nothing_happens_until_apply(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SERVE, "ace")
+    before = len(store.load_events())
+
+    gated_app.button(key="reopen_setup").click().run()
+    assert len(store.load_events()) == before     # rendering the panel changes nothing
