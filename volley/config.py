@@ -26,7 +26,7 @@ DEFAULTS = {
     # Which tabs a push writes. PlayerSetStats drives the dashboard; Events is
     # the append-only archive of the raw rows, and the only thing that makes a
     # lost local buffer recoverable - an aggregate cannot be taken apart again.
-    "VOLLEY_PUSH_TABS": "PlayerSetStats,Events",
+    "VOLLEY_PUSH_TABS": "PlayerSetStats,Events,Matches",
     # A service-account key, if you have one. Share the spreadsheet with the
     # account's email and it works like any other collaborator.
     "VOLLEY_SERVICE_ACCOUNT": str(ROOT / "service_account.json"),

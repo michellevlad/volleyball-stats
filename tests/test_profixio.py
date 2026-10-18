@@ -405,3 +405,44 @@ def test_the_sync_cli_passes_a_match_row_not_an_id(temp_store, protocol, monkeyp
     assert len(saved) == 52
     assert set(saved["match_name"]) == {"Jomala IK C vs Elden VBK"}
     assert set(saved["match_date"]) == {"2026-09-26"}
+
+
+# --- the match sheet --------------------------------------------------------
+
+def test_fixtures_carry_both_teams_and_the_time(season_html):
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+    jomala = next(f for f in fixtures if f["profixio_match_id"] == "32681384")
+    assert jomala["time"] == "14:30"
+    assert jomala["home"] == "Jomala IK C"
+    assert jomala["away"] == TEAM
+
+
+def test_the_score_is_recorded_both_ways_round(season_html):
+    """Home-first for the match sheet, ours-first for everything else."""
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+
+    away = next(f for f in fixtures if f["profixio_match_id"] == "32681384")
+    assert away["home_away"] == "away"
+    assert (away["result_home"], away["sets_home"]) == ("0-3", "9-25, 5-25, 6-25")
+    assert (away["official_result"], away["official_sets"]) == ("3-0", "25-9, 25-5, 25-6")
+
+
+def test_unplayed_fixtures_have_no_scores_either_way(season_html):
+    for fixture in profixio.parse_fixtures(season_html, TEAM):
+        if not fixture["played"]:
+            assert fixture["result_home"] == "" and fixture["sets_home"] == ""
+
+
+def test_the_match_sheet_survives_a_resync(temp_store, season_html):
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+    store.merge_profixio_fixtures(fixtures)
+    matches = store.load_matches()
+    played = matches[matches["result_home"].astype(str) != ""]
+    assert len(played) == 2
+    row = played[played["opponent"] == "Jomala IK C"].iloc[0]
+    assert (row["time"], row["home_team"], row["away_team"]) == (
+        "14:30", "Jomala IK C", "Elden VBK"
+    )
+
+    store.merge_profixio_fixtures(fixtures)
+    assert len(store.load_matches()) == 16

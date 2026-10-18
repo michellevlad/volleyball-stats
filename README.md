@@ -333,21 +333,71 @@ Use **Tab mapping** in the sidebar to say which of your tabs holds what.
 
 ## The dashboard
 
-In [Looker Studio](https://lookerstudio.google.com): **Create → Data source → Google Sheets**, and
-pick `PlayerSetStats`. One source is enough — every other view is a different grouping of it. Set `match_date` as the date dimension and check that the percentages arrive as **Number** and not
-Text.
+In [Looker Studio](https://lookerstudio.google.com): **Create → Data source → Google Sheets**. Two
+sources cover everything — `PlayerSetStats` for anything about players, `Matches` for the fixture
+list.
 
-Four charts worth building:
+Set `match_date` (and `date` on Matches) as the date dimension, and check the counts arrive as
+**Number**, not Text.
 
-All from the one source, just grouped differently:
+### Calculated fields
 
-- **Season leaderboard** — group by `player_name`.
-- **Role comparison** — group by `player_name` and `player_role`: her numbers as OH versus as MB.
-- **Match box score** — group by `player_name`, filtered to one `match_name`.
-- **Set detail** — group by `set_no`, the shape a per-set spreadsheet already has.
-- **Form over time** — `match_date` on the x-axis with hitting efficiency.
+Every rate lives here, not in the sheet — a stored rate cannot be re-aggregated, so these stay
+correct whether the chart shows one set, one match or the whole season.
 
-Looker caches — press **Refresh data** after a push if the numbers look old.
+| Field | Formula |
+|---|---|
+| Points | `SUM(kills) + SUM(aces) + SUM(blocks)` |
+| Games | `COUNT_DISTINCT(match_id)` |
+| Points per match | `(SUM(kills) + SUM(aces) + SUM(blocks)) / COUNT_DISTINCT(match_id)` |
+| Kill % | `SUM(kills) / SUM(attempts)` |
+| Hitting efficiency | `(SUM(kills) - SUM(attack_errors)) / SUM(attempts)` |
+| Pass rating | `(3 * SUM(receptions_perfect) + 2 * SUM(receptions_playable)) / SUM(reception_count)` |
+| Serve error % | `SUM(serve_errors) / SUM(serves)` |
+
+Write them as `SUM(x) / SUM(y)`, never as an average of a rate. Guard a divide-by-zero with
+`NARY_MAX(SUM(attempts), 1)` where a filter could leave a player with none.
+
+### Scorers board
+
+The Profixio top-scorers table, from `PlayerSetStats`:
+
+| | |
+|---|---|
+| **Dimension** | `player_name` |
+| **Metrics** | Points · Points per match · `SUM(kills)` *(their "Anfall")* · `SUM(blocks)` *(Block)* · `SUM(aces)` *(Serveess)* · Games |
+| **Sort** | Points, descending |
+
+Swap the dimension for `player_role` to get the same board by position, or add it as a second
+dimension to see a player split by the roles she played.
+
+> **This covers our players only.** Profixio's board spans the division; ours is built from the
+> protocols you import, and those name almost no opponents — their points come overwhelmingly from
+> *our* errors, which belong to no player. A board including other teams would be wrong rather than
+> incomplete.
+
+### Match list
+
+The fixture view, from `Matches`:
+
+| | |
+|---|---|
+| **Dimensions** | `date` · `time` · `home_team` · `away_team` · `sets_home` · `result_home` |
+| **Sort** | `date` |
+| **Filter** | `result_home` *is not null* for played matches only |
+
+`sets_home` and `result_home` are printed **home side first**, the way the league does
+(`9-25, 5-25, 6-25` and `0-3`). `official_sets` and `official_result` are the same match from our
+point of view (`25-9, 25-5, 25-6` and `3-0`) — use those for anything about how *we* did.
+
+### Worth building too
+
+- **Role comparison** — `PlayerSetStats`, dimensions `player_name` + `player_role`: her numbers as
+  OH versus as MB.
+- **Match box score** — dimension `player_name`, filtered to one `match_name`.
+- **Form over time** — `match_date` across the x-axis against hitting efficiency.
+
+Looker caches; press **Refresh data** after a push if the numbers look old.
 
 ---
 

@@ -185,12 +185,15 @@ def parse_fixtures(html: str, team_name: str) -> list[dict]:
         opponent = away if is_home else home
 
         official_result, official_sets = "", ""
+        result_home, sets_home_text = "", ""
         if info.get("played") and len(numbers) >= 4 and len(numbers) % 2 == 0:
             sets_home, sets_away = numbers[-2], numbers[-1]
             pairs = [(numbers[i], numbers[i + 1]) for i in range(0, len(numbers) - 2, 2)]
+            result_home = f"{sets_home}-{sets_away}"
+            sets_home_text = ", ".join(f"{h}-{a}" for h, a in pairs)
             if is_home:
-                official_result = f"{sets_home}-{sets_away}"
-                official_sets = ", ".join(f"{h}-{a}" for h, a in pairs)
+                official_result = result_home
+                official_sets = sets_home_text
             else:
                 official_result = f"{sets_away}-{sets_home}"
                 official_sets = ", ".join(f"{a}-{h}" for h, a in pairs)
@@ -207,6 +210,8 @@ def parse_fixtures(html: str, team_name: str) -> list[dict]:
             "played": bool(info.get("played")),
             "official_result": official_result,
             "official_sets": official_sets,
+            "result_home": result_home,
+            "sets_home": sets_home_text,
         })
 
     fixtures.sort(key=lambda f: (f["date"], f["time"]))

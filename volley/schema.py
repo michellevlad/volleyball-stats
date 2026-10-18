@@ -125,7 +125,14 @@ ROSTER_COLUMNS = ["player_id", "number", "name", "position", "active"]
 MATCH_COLUMNS = [
     "match_id",
     "date",
+    "time",
     "opponent",
+    # Both sides by name, and the score the way the league prints it: home
+    # first. `official_result`/`official_sets` stay from our point of view.
+    "home_team",
+    "away_team",
+    "result_home",
+    "sets_home",
     "home_away",
     "competition",
     "sets_won",

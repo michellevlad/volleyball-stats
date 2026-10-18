@@ -214,10 +214,14 @@ def set_stats_rows(spreadsheet):
     return [dict(zip(tab.values[0], row)) for row in tab.values[1:]]
 
 
-def test_push_writes_the_table_and_the_archive(spreadsheet):
+def test_push_writes_the_table_the_archive_and_the_match_sheet(spreadsheet):
     result = sheets.push(spreadsheet, make_events(2), make_matches())
-    assert set(result["tabs"]) == {schema.TAB_SET_STATS, schema.TAB_EVENTS}
-    assert set(spreadsheet.tabs) == {"Eventos", schema.TAB_SET_STATS, schema.TAB_EVENTS}
+    assert set(result["tabs"]) == {
+        schema.TAB_SET_STATS, schema.TAB_EVENTS, schema.TAB_MATCHES
+    }
+    assert set(spreadsheet.tabs) == {
+        "Eventos", schema.TAB_SET_STATS, schema.TAB_EVENTS, schema.TAB_MATCHES
+    }
 
 
 def test_the_per_set_table_alone_is_still_possible(spreadsheet, monkeypatch):
