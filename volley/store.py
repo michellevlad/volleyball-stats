@@ -126,6 +126,7 @@ def build_event(
     score_us: int = 0,
     score_them: int = 0,
     role: str = "",
+    target_num=None,
     source: str = schema.SOURCE_MANUAL,
     event_id: str = "",
 ) -> dict:
@@ -147,6 +148,7 @@ def build_event(
         "action": action,
         "action_result": result,
         "is_point": schema.is_point(action, result),
+        "target_num": "" if target_num in (None, "") else int(target_num),
         "source": source,
         "event_id": event_id or new_id(),
         "seq": int(seq),
@@ -598,3 +600,75 @@ def lineup_from_events(match_id: str, set_no: int) -> list:
             "player_role": row["player_role"],
         })
     return sorted(out, key=lambda r: r["player_num"])
+
+
+# --- reconciling what you entered with the official record ------------------
+
+def protocol_score(match_id: str, set_no: int):
+    """The official score at the end of a set, or None if there is no protocol.
+
+    When this exists the scoreboard follows it rather than counting along with
+    what you record - otherwise correcting one mis-attributed kill also adds a
+    point to the set, and the two records drift apart.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id)
+        & (events["set_no"] == int(set_no))
+        & (events["source"] == schema.SOURCE_PROFIXIO)
+    ]
+    if not len(rows):
+        return None
+    return int(rows["score_us"].max()), int(rows["score_them"].max())
+
+
+def duplicate_candidates(match_id: str, set_no: int) -> pd.DataFrame:
+    """Point-scoring events in a set that already has an official protocol.
+
+    Only these can be duplicates: the protocol records nothing else, so a
+    reception or a dig you entered cannot collide with it and is never shown.
+
+    Returns both sources together, ordered so a manual event sits next to the
+    protocol events it matches, with `matches` counting how many the other
+    source holds for the same (player, action, result).
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id) & (events["set_no"] == int(set_no))
+    ].copy()
+    if not len(rows):
+        return pd.DataFrame(columns=list(events.columns) + ["matches", "keep"])
+
+    scoring = rows.apply(
+        lambda row: schema.is_point(row["action"], row["action_result"]), axis=1
+    )
+    rows = rows[scoring]
+    if schema.SOURCE_PROFIXIO not in set(rows["source"]):
+        return rows.iloc[0:0].assign(matches=0, keep=True)
+
+    key = ["player_num", "action", "action_result"]
+    counts = rows.groupby(key + ["source"]).size().unstack("source", fill_value=0)
+
+    def other(row):
+        wanted = (
+            schema.SOURCE_PROFIXIO
+            if row["source"] == schema.SOURCE_MANUAL
+            else schema.SOURCE_MANUAL
+        )
+        index = tuple(row[column] for column in key)
+        if index not in counts.index or wanted not in counts.columns:
+            return 0
+        return int(counts.loc[index, wanted])
+
+    rows["matches"] = rows.apply(other, axis=1)
+    # The protocol is kept by default; a manual event is kept only when the
+    # protocol has nothing like it, which makes it a correction rather than a
+    # re-entry of a point that is already there.
+    rows["keep"] = (rows["source"] == schema.SOURCE_PROFIXIO) | (rows["matches"] == 0)
+    return rows.sort_values(key + ["source"])
+
+
+def drop_events(event_ids) -> pd.DataFrame:
+    events = load_events()
+    save_events(events[~events["event_id"].isin(list(event_ids))])
+    return load_events()

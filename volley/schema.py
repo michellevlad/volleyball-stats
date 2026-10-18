@@ -42,17 +42,15 @@ ACTIONS = {
 # playable ball is still far better than a shank.
 RECEPTION_VALUES = {"perfect": 3, "playable": 2, "error": 0}
 
-ACTION_ORDER = [ATTACK, SERVE, RECEPTION, DIG, BLOCK, SET]
+ACTION_ORDER = [SERVE, ATTACK, RECEPTION, DIG, BLOCK, SET]
 
 # Short labels for the result buttons, so the grid stays readable.
+# Plain words only. A parenthetical number would suggest a single scale, and a
+# "0" means something different for an attack than for a reception.
 RESULT_LABELS = {
-    (RECEPTION, "perfect"): "perfect",
-    (RECEPTION, "playable"): "playable",
-    (RECEPTION, "error"): "error",
-    (ATTACK, "attempt"): "attempt (0)",
     (BLOCK, "kill"): "block point",
-    (BLOCK, "attempt"): "touch (0)",
-    (SET, "attempt"): "set (0)",
+    (BLOCK, "attempt"): "touch",
+    (SET, "attempt"): "set",
 }
 
 # Results that end the rally in our favour and so bump our score by one.
@@ -155,6 +153,8 @@ EVENT_COLUMNS = [
     "action",
     "action_result",
     "is_point",
+    # Who an assist was set to. Blank on everything else.
+    "target_num",
     "source",
     "event_id",
     "seq",

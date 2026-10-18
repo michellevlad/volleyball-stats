@@ -289,13 +289,13 @@ def test_the_documented_spreadsheet_columns_do_not_drift():
         "match_id", "set_no", "player_num", "player_name", "player_role"
     ]
     # The fields asked for, in the order asked for.
-    assert schema.EVENT_COLUMNS[:11] == [
+    assert schema.EVENT_COLUMNS[:12] == [
         "match_id", "match_date", "match_name", "set_no",
         "player_num", "player_name", "player_role",
-        "action", "action_result", "is_point", "source",
+        "action", "action_result", "is_point", "target_num", "source",
     ]
     # ...then the four that make the editor and the per-set check work.
-    assert schema.EVENT_COLUMNS[11:] == ["event_id", "seq", "score_us", "score_them"]
+    assert schema.EVENT_COLUMNS[12:] == ["event_id", "seq", "score_us", "score_them"]
     # Players are identified by shirt number, nothing else.
     for columns in (schema.EVENT_COLUMNS, schema.LINEUP_COLUMNS,
                     schema.SET_STATS_COLUMNS):

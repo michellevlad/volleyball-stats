@@ -26,11 +26,13 @@ def offline(app):
     return app
 
 
-def record(app, number, action, result):
-    """Record one event the only way there is now: three taps."""
-    app.button(key=f"player::p{number}").click().run()
+def record(app, number, action, result, target=None):
+    """Record one event the only way there is now: action, result, player."""
     app.button(key=f"action::{action}").click().run()
     app.button(key=f"result::{action}::{result}").click().run()
+    app.button(key=f"player::p{number}").click().run()
+    if target is not None:                      # an assist needs a fourth tap
+        app.button(key=f"target::p{target}").click().run()
     return app
 
 
@@ -74,11 +76,11 @@ def test_app_renders_without_exceptions(app):
 
 
 def test_three_clicks_record_an_event_and_bump_the_score(app):
-    app.button(key="player::p7").click().run()
-    assert not app.exception
     app.button(key=f"action::{schema.ATTACK}").click().run()
     assert not app.exception
     app.button(key=f"result::{schema.ATTACK}::kill").click().run()
+    assert not app.exception
+    app.button(key="player::p7").click().run()
     assert not app.exception
 
     events = store.load_events()
@@ -89,9 +91,10 @@ def test_three_clicks_record_an_event_and_bump_the_score(app):
     assert row["score_them"] == 0
     assert row["synced"] == False        # noqa: E712 - nothing pushed yet
 
-    # Selection resets so the next event starts from the player grid again.
-    assert app.session_state["sel_player"] is None
+    # Selection resets so the next event starts from the action row again.
     assert app.session_state["sel_action"] is None
+    assert app.session_state["sel_result"] is None
+    assert app.session_state["sel_player"] is None
 
 
 def test_undo_removes_the_last_event(app):
@@ -229,7 +232,7 @@ def test_setup_blocks_the_workspace_until_confirmed(gated_app):
     assert any("Match setup" in s.value for s in gated_app.subheader)
     # The entry surface is not reachable yet.
     with pytest.raises(KeyError):
-        gated_app.button(key="player::p7")
+        gated_app.button(key=f"action::{schema.ATTACK}")
 
 
 def test_starting_entry_opens_the_workspace_and_saves_the_squad(gated_app):
@@ -242,6 +245,8 @@ def test_starting_entry_opens_the_workspace_and_saves_the_squad(gated_app):
     assert not gated_app.exception
 
     assert gated_app.session_state["setup_done_for"] == MATCH["match_id"]
+    gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    gated_app.button(key=f"result::{schema.ATTACK}::kill").click().run()
     assert gated_app.button(key="player::p7") is not None
     match = store.load_matches().iloc[0].to_dict()
     assert store.squad_numbers(match) == [4, 7]
@@ -254,6 +259,8 @@ def test_the_squad_filters_the_player_grid(gated_app):
         (False, 12, "Bea", "S"),
     ])
     gated_app.button(key="start_entering").click().run()
+    gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    gated_app.button(key=f"result::{schema.ATTACK}::kill").click().run()
 
     keys = [b.key for b in gated_app.button if b.key.startswith("player::")]
     assert keys == ["player::p4", "player::p7"]
@@ -265,7 +272,6 @@ def test_the_shirt_number_can_differ_from_the_roster(gated_app):
     gated_app.button(key="start_entering").click().run()
     assert not gated_app.exception
 
-    assert [b.label for b in gated_app.button if b.key.startswith("player::")] == ["#77 Ana"]
     record(gated_app, 77, schema.ATTACK, "attempt")
     row = store.load_events().iloc[-1]
     assert int(row["player_num"]) == 77 and row["player_name"] == "Ana"
@@ -358,7 +364,6 @@ def test_scoring_actions_stay_available_with_a_protocol_imported(gated_app):
     """Not every match is scored carefully; a wrong point has to be fixable."""
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
-    gated_app.button(key="player::p7").click().run()
     gated_app.button(key=f"action::{schema.ATTACK}").click().run()
 
     for result in schema.ACTIONS[schema.ATTACK]:
@@ -385,18 +390,21 @@ def test_what_the_protocol_already_holds_is_shown(gated_app):
     """Informational, so you can tell a correction from a duplicate."""
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
-    gated_app.button(key="player::p7").click().run()
     gated_app.button(key=f"action::{schema.SERVE}").click().run()
+    gated_app.button(key=f"result::{schema.SERVE}::ace").click().run()
 
+    # Before the player row, so it can stop a double entry rather than report
+    # one that has already happened.
     captions = " ".join(c.value for c in gated_app.caption)
     assert "official protocol already has" in captions
     assert "#7" in captions
+    assert "player::p7" in [b.key for b in gated_app.button]
 
 
 def test_nothing_is_said_when_there_is_no_protocol(gated_app):
     gated_app.button(key="start_entering").click().run()
-    gated_app.button(key="player::p7").click().run()
     gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    gated_app.button(key=f"result::{schema.ATTACK}::kill").click().run()
     assert not any("official protocol already has" in c.value for c in gated_app.caption)
 
     before = len(store.load_events())
@@ -551,14 +559,14 @@ def test_the_set_buttons_move_you_between_sets(gated_app):
 
 def test_next_set_advances_and_clears_the_selection(gated_app):
     gated_app.button(key="start_entering").click().run()
-    gated_app.button(key="player::p7").click().run()
-    assert gated_app.session_state["sel_player"] is not None
+    gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    assert gated_app.session_state["sel_action"] is not None
 
     gated_app.button(key="next_set").click().run()
     assert not gated_app.exception
     assert gated_app.session_state["set_no"] == 2
     # A half-finished tap must not carry into the next set.
-    assert gated_app.session_state["sel_player"] is None
+    assert gated_app.session_state["sel_action"] is None
 
 
 def test_the_last_set_cannot_advance(gated_app):
@@ -739,3 +747,89 @@ def test_saving_roles_keeps_the_video_and_persists(gated_app, monkeypatch):
     assert seen[-1] == "pcRoX34oP7U"
     assert any("Roles saved" in m.value for m in gated_app.success)
     assert s.load_matches().iloc[0]["video_url"] == "https://youtu.be/pcRoX34oP7U"
+
+
+# --- the score follows the official record ----------------------------------
+
+@needs_protocol
+def test_recording_a_kill_does_not_move_an_official_score(gated_app):
+    """A correction fixes the player; it must not also inflate the set."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    us_key = f"score_us::{MATCH['match_id']}::1"
+    before = gated_app.session_state[us_key]
+    assert before == 25                       # the official set score
+
+    record(gated_app, 7, schema.ATTACK, "kill")
+    record(gated_app, 7, schema.ATTACK, "error")
+    assert not gated_app.exception
+    assert gated_app.session_state[us_key] == 25
+
+
+def test_without_a_protocol_the_score_counts_both_ways(gated_app):
+    gated_app.button(key="start_entering").click().run()
+    us_key = f"score_us::{MATCH['match_id']}::1"
+    them_key = f"score_them::{MATCH['match_id']}::1"
+    gated_app.session_state[us_key] = 0
+    gated_app.session_state[them_key] = 0
+    gated_app.run()
+
+    record(gated_app, 7, schema.ATTACK, "kill")
+    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 0)
+
+    # An error hands the point to the other side.
+    record(gated_app, 7, schema.ATTACK, "error")
+    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 1)
+
+    record(gated_app, 7, schema.RECEPTION, "error")
+    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 2)
+
+    # Neutral results move nothing.
+    record(gated_app, 7, schema.ATTACK, "attempt")
+    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 2)
+
+
+# --- an assist records who it went to ---------------------------------------
+
+def test_an_assist_asks_who_it_was_set_to(gated_app):
+    gated_app.button(key="start_entering").click().run()
+    gated_app.button(key=f"action::{schema.SET}").click().run()
+    gated_app.button(key=f"result::{schema.SET}::assist").click().run()
+    gated_app.button(key="player::p7").click().run()
+    assert not gated_app.exception
+
+    # Nothing recorded yet - it is waiting for the target.
+    assert len(store.load_events()) == 0
+    targets = [b.key for b in gated_app.button if b.key.startswith("target::")]
+    assert "target::p4" in targets
+    assert "target::p7" not in targets        # she cannot set to herself
+
+    gated_app.button(key="target::p4").click().run()
+    events = store.load_events()
+    assert len(events) == 1
+    row = events.iloc[0]
+    assert (row["action"], row["action_result"]) == (schema.SET, "assist")
+    assert int(row["player_num"]) == 7
+    assert int(row["target_num"]) == 4
+
+
+def test_every_other_result_still_takes_three_taps(gated_app):
+    gated_app.button(key="start_entering").click().run()
+    record(gated_app, 7, schema.SET, "attempt")   # labelled "set" in the UI
+    assert not gated_app.exception
+    events = store.load_events()
+    assert len(events) == 1
+    assert events.iloc[0]["target_num"] == ""
+    assert not [b.key for b in gated_app.button if b.key.startswith("target::")]
+
+
+def test_the_action_row_is_always_in_the_same_place(gated_app):
+    """The point of the reorder: the first row never moves."""
+    gated_app.button(key="start_entering").click().run()
+    first = [b.key for b in gated_app.button if b.key.startswith("action::")]
+    assert first == [f"action::{a}" for a in schema.ACTION_ORDER]
+    assert first[0] == f"action::{schema.SERVE}"      # serve before attack
+
+    record(gated_app, 7, schema.DIG, "dig")
+    after = [b.key for b in gated_app.button if b.key.startswith("action::")]
+    assert after == first

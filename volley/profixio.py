@@ -363,10 +363,13 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
     """
     match_id = match.get("match_id", "")
     we_are_home = protocol.get("home", "").strip() == team_name.strip()
-    by_number = {}
+    # Matched by name, never by number. Shirt numbers are reassigned between
+    # matches, so looking the roster up by number stamps whoever wears that
+    # shirt *now* onto points scored by whoever wore it *then*.
+    by_name = {}
     if roster is not None and len(roster):
         for player in roster.to_dict("records"):
-            by_number[int(player["number"])] = player
+            by_name[str(player["name"]).strip()] = player
 
     events = []
     set_no, seq = 1, 0
@@ -389,7 +392,7 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             continue
 
         action, result = mapped
-        known = by_number.get(row["number"], {})
+        known = by_name.get(str(row["player"]).strip(), {})
         seq += 1
         events.append({
             "match_id": match_id,
@@ -397,7 +400,8 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             "match_name": store.match_name(match),
             "set_no": set_no,
             "player_num": row["number"],
-            "player_name": known.get("name") or row["player"],
+            # The protocol is the record of who actually played in this match.
+            "player_name": row["player"] or known.get("name", ""),
             "player_role": "",
             "action": action,
             "action_result": result,

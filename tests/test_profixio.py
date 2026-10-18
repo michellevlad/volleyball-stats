@@ -213,18 +213,17 @@ def test_imported_events_are_tagged_as_imported(events):
     assert all(e["match_date"] == "2026-09-26" for e in events)
 
 
-def test_the_roster_name_wins_over_the_protocol_spelling(protocol):
+def test_the_protocol_name_wins_over_whoever_wears_that_shirt_now(protocol):
+    """Luisa wore #4 that day; Maryam wears it now. The points are Luisa's."""
     roster = pd.DataFrame(
-        [{"player_id": "p99", "number": 99, "name": "Milena J", "position": "OH",
+        [{"player_id": "p4", "number": 4, "name": "Maryam Al-saqa", "position": "S",
           "active": True}],
         columns=schema.ROSTER_COLUMNS,
     )
     events = profixio.protocol_to_events(protocol, TEAM, MATCH, roster)
-    milena = next(e for e in events if e["player_num"] == 99)
-    assert milena["player_name"] == "Milena J"
-    # Anyone not on the roster keeps the name the protocol gave them.
-    other = next(e for e in events if e["player_num"] != 99)
-    assert other["player_name"]
+    four = next(e for e in events if e["player_num"] == 4)
+    assert four["player_name"] == "Luisa Velez Ledesma"
+    assert all(event["player_name"] for event in events)
 
 
 def test_the_box_score_matches_the_official_sets(events):

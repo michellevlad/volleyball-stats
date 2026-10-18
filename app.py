@@ -38,8 +38,9 @@ def init_state() -> None:
     defaults = {
         "match_id": "",
         "set_no": 1,
-        "sel_player": None,
         "sel_action": None,
+        "sel_result": None,
+        "sel_player": None,
         "flash": None,
         "spreadsheet": None,
         "spreadsheet_title": "",
@@ -66,12 +67,19 @@ def score_keys(match_id: str, set_no: int) -> tuple[str, str]:
 
 
 def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None:
-    """Seed the score widgets from the last event of the set (survives a restart)."""
+    """Seed the score widgets, preferring the official record.
+
+    A set with a protocol already has a score for every point, so take it. The
+    running total only has to be maintained by hand when there is nothing
+    official to take it from.
+    """
     us_key, them_key = score_keys(match_id, set_no)
-    if us_key not in st.session_state or them_key not in st.session_state:
-        us, them = store.current_score(events, match_id, set_no)
-        st.session_state.setdefault(us_key, us)
-        st.session_state.setdefault(them_key, them)
+    if us_key in st.session_state and them_key in st.session_state:
+        return
+    official = store.protocol_score(match_id, set_no)
+    us, them = official if official else store.current_score(events, match_id, set_no)
+    st.session_state.setdefault(us_key, us)
+    st.session_state.setdefault(them_key, them)
 
 
 def current_video_id() -> str | None:
@@ -80,13 +88,19 @@ def current_video_id() -> str | None:
 
 # --- recording --------------------------------------------------------------
 
-def commit(match: dict, player: dict, action: str, result: str) -> None:
+def commit(match: dict, player: dict, action: str, result: str, target_num=None) -> None:
     match_id = match["match_id"]
     set_no = int(st.session_state.set_no)
-
     us_key, them_key = score_keys(match_id, set_no)
-    if schema.is_point(action, result):
-        st.session_state[us_key] = int(st.session_state[us_key]) + 1
+
+    # With an official protocol the score is already known for every point, so
+    # recording an action never moves it - that is what stops a correction from
+    # also inflating the set. Without one, keep count as you go.
+    if store.protocol_score(match_id, set_no) is None:
+        if schema.is_point(action, result):
+            st.session_state[us_key] = int(st.session_state[us_key]) + 1
+        elif result == "error":
+            st.session_state[them_key] = int(st.session_state[them_key]) + 1
 
     events = store.load_events()
     event = store.build_event(
@@ -99,41 +113,59 @@ def commit(match: dict, player: dict, action: str, result: str) -> None:
         score_us=int(st.session_state[us_key]),
         score_them=int(st.session_state[them_key]),
         role=store.role_of(match_id, set_no, player["number"], player.get("position", "")),
+        target_num=target_num,
     )
     store.append_event(event)
-    st.session_state.sel_player = None
     st.session_state.sel_action = None
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
+    to = f" → #{target_num}" if target_num else ""
     flash("success",
-          f"#{event['player_num']} {event['player_name']} · {action.lower()} {result}")
+          f"#{event['player_num']} {event['player_name']} · {action.lower()} {result}{to}")
 
 
 # --- callbacks (run before the script reruns) ------------------------------
 
-def cb_pick_player(player: dict) -> None:
-    st.session_state.sel_player = player
-    st.session_state.sel_action = None
-
-
 def cb_pick_action(action: str) -> None:
     st.session_state.sel_action = action
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
 
 
-def cb_pick_result(match: dict, result: str) -> None:
-    player = st.session_state.sel_player
+def cb_pick_result(result: str) -> None:
+    st.session_state.sel_result = result
+    st.session_state.sel_player = None
+
+
+def cb_pick_player(match: dict, player: dict) -> None:
+    """The player tap commits - unless it is an assist, which needs a target."""
     action = st.session_state.sel_action
-    if player and action:
-        commit(match, player, action, result)
+    result = st.session_state.sel_result
+    if not action or not result:
+        return
+    if action == schema.SET and result == "assist":
+        st.session_state.sel_player = player
+        return
+    commit(match, player, action, result)
+
+
+def cb_pick_target(match: dict, target: dict) -> None:
+    player = st.session_state.sel_player
+    if player:
+        commit(match, player, schema.SET, "assist", target_num=int(target["number"]))
 
 
 def cb_clear_selection() -> None:
-    st.session_state.sel_player = None
     st.session_state.sel_action = None
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
 
 
 def cb_goto_set(set_no: int) -> None:
     st.session_state.set_no = int(set_no)
-    st.session_state.sel_player = None
     st.session_state.sel_action = None
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
 
 
 def cb_bump(key: str, delta: int) -> None:
@@ -537,35 +569,36 @@ def player_label(player: dict, squad: list) -> str:
     return f"#{int(player['number'])} {first}".strip()
 
 
+def _player_row(squad: list, match: dict, caption: str, callback, exclude=None) -> None:
+    st.caption(caption)
+    shown = [p for p in squad if exclude is None or int(p["number"]) != int(exclude)]
+    per_row = min(8, max(4, len(shown)))
+    columns = st.columns(per_row)
+    for index, player in enumerate(shown):
+        columns[index % per_row].button(
+            player_label(player, squad),
+            key=f"player::p{int(player['number'])}" if exclude is None
+                else f"target::p{int(player['number'])}",
+            on_click=callback,
+            args=(match, player),
+            width="stretch",
+        )
+
+
 def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
-    """Player -> action -> result, three taps, meant to sit under the video."""
+    """Action, then result, then player.
+
+    The action row never changes, so it is always in the same place; the player
+    row - the one that differs between matches - comes last, by which point the
+    name is already known.
+    """
     players = store.squad_players(roster, match, int(st.session_state.set_no))
     if not len(players):
         st.warning("Nobody called up. Reopen Match setup to pick the squad.")
         return
-
     squad = players.to_dict("records")
-    selected = st.session_state.sel_player
 
-    st.caption("Player")
-    per_row = min(8, max(4, len(squad)))
-    columns = st.columns(per_row)
-    for index, player in enumerate(squad):
-        is_selected = bool(selected and selected["player_id"] == player["player_id"])
-        columns[index % per_row].button(
-            player_label(player, squad),
-            key=f"player::{player['player_id']}",
-            on_click=cb_pick_player,
-            args=(player,),
-            width="stretch",
-            type="primary" if is_selected else "secondary",
-        )
-
-    if not selected:
-        st.caption("Pick a player to see the actions.")
-        return
-
-    st.caption(f"Action · #{selected['number']} {selected['name']}")
+    st.caption("Action")
     action_columns = st.columns(len(schema.ACTION_ORDER) + 1)
     for index, action in enumerate(schema.ACTION_ORDER):
         action_columns[index].button(
@@ -577,11 +610,12 @@ def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
             type="primary" if st.session_state.sel_action == action else "secondary",
         )
     action_columns[-1].button(
-        "✕", key="cancel", on_click=cb_clear_selection, width="stretch", help="Cancel"
+        "✕", key="cancel", on_click=cb_clear_selection, width="stretch", help="Start over"
     )
 
     action = st.session_state.sel_action
     if not action:
+        st.caption("Pick an action to see its results.")
         return
 
     st.caption(f"Result · {action.title()}")
@@ -592,23 +626,45 @@ def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
             schema.result_label(action, result),
             key=f"result::{action}::{result}",
             on_click=cb_pick_result,
-            args=(match, result),
+            args=(result,),
             width="stretch",
-            type="primary",
+            type="primary" if st.session_state.sel_result == result else "secondary",
         )
 
-    # Not a warning, just what the protocol already holds - the scoresheet is
-    # usually right, but it is not always, and it is never the whole picture.
-    already = store.protocol_count(
-        match["match_id"], st.session_state.set_no, selected["number"], action
-    )
-    if already:
-        st.caption(
-            f"The official protocol already has {already} "
-            f"{action.lower()} point{'s' if already > 1 else ''} for "
-            f"#{selected['number']} in set {st.session_state.set_no}."
-        )
+    result = st.session_state.sel_result
+    if not result:
+        return
 
+    # Which players already have this from the official record, shown before
+    # you tap rather than after - the point is to prevent the double entry, not
+    # to report it once it has happened.
+    if schema.is_point(action, result):
+        have = []
+        for player in squad:
+            count = store.protocol_count(
+                match["match_id"], st.session_state.set_no, player["number"], action
+            )
+            if count:
+                have.append(f"#{int(player['number'])}×{count}")
+        if have:
+            st.caption(
+                f"The official protocol already has {action.lower()} points for "
+                + " · ".join(have)
+                + " — only add one if the protocol got it wrong."
+            )
+
+    assist = action == schema.SET and result == "assist"
+    chosen = st.session_state.sel_player
+    if not (assist and chosen):
+        _player_row(squad, match, f"Player · {action.lower()} {result}", cb_pick_player)
+
+    # An assist needs one more tap: who it was set to.
+    if assist and chosen:
+        _player_row(
+            squad, match,
+            f"#{chosen['number']} {chosen['name']} set it to…",
+            cb_pick_target, exclude=chosen["number"],
+        )
 
 def entry_panel(roster: pd.DataFrame, match: dict) -> None:
     entry_buttons(roster, match)
