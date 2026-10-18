@@ -749,7 +749,7 @@ def import_protocol(match: dict, pdf_bytes: bytes) -> None:
         team = config.team_name()
         summary = profixio.protocol_summary(protocol, team)
         events = profixio.protocol_to_events(
-            protocol, team, match["match_id"], store.load_roster()
+            protocol, team, match, store.load_roster()
         )
         if not events:
             flash("error", f"No {team} events found in that protocol - wrong match?")

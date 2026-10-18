@@ -635,3 +635,36 @@ def test_the_default_match_is_the_last_one_played(temp_store, monkeypatch):
     app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
     assert not app.exception
     assert app.selectbox(key="setup_match").value == "2026-10-03-jomala-ik-b"
+
+
+# --- importing a protocol from the app --------------------------------------
+
+@needs_protocol
+def test_the_import_button_actually_imports(gated_app, monkeypatch):
+    """Drives the app's own import, not profixio directly.
+
+    Both the CLI and this went on passing a match id where protocol_to_events
+    wants the whole match row, because every test called profixio directly and
+    skipped the app's wrapper entirely.
+    """
+    from pathlib import Path as _Path
+
+    from volley import profixio
+
+    pdf = (_Path(__file__).parent / "fixtures" / "a_32681384.pdf").read_bytes()
+    store.upsert_match({**MATCH, "profixio_match_id": "32681384"})
+    monkeypatch.setattr(profixio, "find_downloaded_protocol",
+                        lambda *a, **k: _Path("a_32681384.pdf"))
+    monkeypatch.setattr(profixio, "read_protocol_file", lambda path: pdf)
+
+    gated_app.run()
+    gated_app.button(key="import_found").click().run()
+    assert not gated_app.exception
+
+    events = store.load_events()
+    assert len(events) == 52
+    assert set(events["source"]) == {schema.SOURCE_PROFIXIO}
+    # The match details every row carries come from the match row, not an id.
+    assert set(events["match_name"]) == {"Elden VBK vs Lions"}   # a home game
+    assert set(events["match_date"]) == {MATCH["date"]}
+    assert any("52 events" in s.value for s in gated_app.success)
