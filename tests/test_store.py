@@ -179,43 +179,43 @@ def test_every_event_carries_the_match_details():
 def test_two_players_cannot_share_a_shirt_in_one_set():
     """A squad recorded in old numbering can collide with the current roster."""
     store.set_lineup("m1", 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "OH"},
-        {"player_num": 4, "player_name": "Maryam", "player_role": "S"},
+        {"player_num": 4, "player_name": "Nadia", "player_role": "OH"},
+        {"player_num": 4, "player_name": "Elin", "player_role": "S"},
     ])
     squad = store.squad_players(pd.DataFrame(columns=schema.ROSTER_COLUMNS),
                                 {"match_id": "m1"}, 1)
     assert list(squad["number"]) == [4]
-    assert list(squad["name"]) == ["Luisa"]
+    assert list(squad["name"]) == ["Nadia"]
 
 
 def test_correcting_the_lineup_fixes_names_on_events_already_recorded():
     """A shirt that changed hands between seasons must not rewrite history."""
     store.set_lineup("m1", 1, [
-        {"player_num": 4, "player_name": "Maryam", "player_role": "S"},
+        {"player_num": 4, "player_name": "Elin", "player_role": "S"},
     ])
     store.append_event(make_event(set_no=1, seq=1))
     store.append_event(store.build_event(
         match=MATCH, set_no=1, seq=2,
-        player={"player_id": "p4", "number": 4, "name": "Maryam"},
+        player={"player_id": "p4", "number": 4, "name": "Elin"},
         action=schema.ATTACK, result="kill",
     ))
-    assert "Maryam" in set(store.load_events()["player_name"])
+    assert "Elin" in set(store.load_events()["player_name"])
 
     store.set_lineup("m1", 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"},
     ])
     store.restamp_players("m1", 1)
 
     events = store.load_events()
     four = events[events["player_num"] == 4]
-    assert set(four["player_name"]) == {"Luisa"}
+    assert set(four["player_name"]) == {"Nadia"}
     # Everyone else is left alone.
     assert set(events[events["player_num"] == 7]["player_name"]) == {"Ana"}
 
 
 def test_restamping_leaves_a_number_the_lineup_does_not_mention():
     store.set_lineup("m1", 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"},
     ])
     store.append_event(make_event(set_no=1, seq=1))      # #7 Ana, not in the line-up
     store.restamp_players("m1", 1)
@@ -311,6 +311,6 @@ def test_mark_reviewed_sticks(temp_store):
 
 def test_names_for_set_reads_the_lineup(temp_store):
     store.set_lineup("m1", 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "S"}])
-    assert store.names_for_set("m1", 1) == {4: "Luisa"}
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"}])
+    assert store.names_for_set("m1", 1) == {4: "Nadia"}
     assert store.names_for_set("m1", 2) == {}

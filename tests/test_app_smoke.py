@@ -925,38 +925,39 @@ def save_editor(app, frame, match_id=None):
 
 
 def test_saving_edits_keeps_the_lineup_name_not_the_rosters(app):
-    """#4 was Luisa that day; the roster has since given #4 to someone else.
+    """#4 was one player that day; the roster has since given #4 to another.
 
     Saving used to look the name up in the roster by number, so every point
-    Luisa scored came back stamped with the current holder of her old shirt.
+    the first player scored came back stamped with the current holder of her
+    old shirt - including rows the official protocol had named correctly.
     """
     match_id = MATCH["match_id"]
     store.save_roster(pd.DataFrame([
-        {"player_id": "", "number": 4, "name": "Maryam", "position": "S", "active": True},
-        {"player_id": "", "number": 17, "name": "Luisa", "position": "S", "active": True},
+        {"player_id": "", "number": 4, "name": "Elin", "position": "S", "active": True},
+        {"player_id": "", "number": 17, "name": "Nadia", "position": "S", "active": True},
     ]))
     store.set_lineup(match_id, 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "S"}])
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"}])
     store.append_event(store.build_event(
         match=MATCH, set_no=1, seq=1,
-        player={"number": 4, "name": "Luisa"},
+        player={"number": 4, "name": "Nadia"},
         action=schema.SERVE, result="ace",
     ))
 
     save_editor(app, editor_rows(app))
     assert not app.exception
-    assert list(store.load_events()["player_name"]) == ["Luisa"]
+    assert list(store.load_events()["player_name"]) == ["Nadia"]
 
 
 def test_changing_the_number_re_resolves_the_name_from_the_lineup(app):
     match_id = MATCH["match_id"]
     store.set_lineup(match_id, 1, [
-        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"},
         {"player_num": 7, "player_name": "Ana", "player_role": "OH"},
     ])
     store.append_event(store.build_event(
         match=MATCH, set_no=1, seq=1,
-        player={"number": 4, "name": "Luisa"},
+        player={"number": 4, "name": "Nadia"},
         action=schema.ATTACK, result="kill",
     ))
 

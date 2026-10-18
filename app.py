@@ -865,7 +865,7 @@ def save_edits(edited: pd.DataFrame, match_id: str) -> None:
 
     The name is resolved from the match line-up, never from the roster. The
     roster is current; the line-up is the record of who wore which shirt on the
-    day. Looking a number up in the roster is how points scored by #4 Luisa in
+    day. Looking a number up in the roster is how points scored by #4 in
     September came back stamped with the name of whoever wears #4 now.
     """
     problems = []

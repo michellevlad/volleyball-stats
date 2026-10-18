@@ -261,7 +261,7 @@ a protocol, so they are never shown and never touched.
 
 Each row says what both sides hold: `protocol 4 · you 2`. The guess is that a row the protocol also
 has is a re-entry, and a row it has nothing like is a correction — because **the scoresheet is
-sometimes wrong**, and "Milena had 10 aces, not 7" has to be recordable.
+sometimes wrong**, and "she had 10 aces, not 7" has to be recordable.
 
 **Apply is how you record a decision, not just how you delete.** It removes what you unticked and
 marks everything you kept as reviewed, so it is never questioned again — a kept row comes back

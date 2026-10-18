@@ -583,13 +583,13 @@ def test_a_corrected_name_reaches_rows_already_in_the_sheet(spreadsheet):
     tab = spreadsheet.worksheet(schema.TAB_EVENTS)
     assert {dict(zip(tab.values[0], r))["player_name"] for r in tab.values[1:]} == {"Ana"}
 
-    corrected = events.assign(player_name="Luisa")
+    corrected = events.assign(player_name="Nadia")
     result = sheets.push(spreadsheet, corrected, make_matches())
     assert result["corrected"] == 2
     assert result["tabs"][schema.TAB_EVENTS] == 2
 
     rows = [dict(zip(tab.values[0], r)) for r in tab.values[1:]]
-    assert {r["player_name"] for r in rows} == {"Luisa"}
+    assert {r["player_name"] for r in rows} == {"Nadia"}
     assert len(rows) == 2, "correcting must not duplicate the row"
 
 
@@ -631,9 +631,9 @@ def test_columns_the_app_does_not_know_about_survive_a_correction():
          schema.ATTACK, "kill", "True", "", schema.SOURCE_MANUAL, "m1-s1-0", "1", "1", "0",
          "from the pipe"],
     ])
-    corrected = make_events(1).assign(player_name="Luisa")
+    corrected = make_events(1).assign(player_name="Nadia")
     sheets.mirror_rows_by_id(worksheet, corrected, schema.EVENT_COLUMNS)
 
     row = dict(zip(worksheet.values[0], worksheet.values[1]))
-    assert row["player_name"] == "Luisa"
+    assert row["player_name"] == "Nadia"
     assert row["Comentario"] == "from the pipe"
