@@ -183,6 +183,24 @@ def cb_start_entering(match_id: str) -> None:
     st.session_state.setup_done_for = match_id
 
 
+def cb_save_roles(match_id: str, set_no: int, edited, players: list) -> None:
+    by_number = {int(player["number"]): player for player in players}
+    rows = []
+    for record in edited.to_dict("records"):
+        if by_number.get(int(record["player_num"])) is None:
+            continue
+        rows.append({
+            "player_num": int(record["player_num"]),
+            "player_name": record["player_name"],
+            "player_role": str(record["player_role"] or ""),
+        })
+    store.set_lineup(match_id, set_no, rows)
+    # Events already recorded carry a role; push the change through so the two
+    # cannot quietly disagree.
+    store.restamp_roles(match_id, set_no)
+    flash("success", f"Roles saved for set {set_no}")
+
+
 def cb_save_video_url(match: dict) -> None:
     url = st.session_state.get("video_url_input", "").strip()
     if url and not video.parse_youtube_id(url):
@@ -843,24 +861,10 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
             ),
         },
     )
-    if st.button("Save roles", key=f"{key}::save", width="stretch"):
-        by_number = {int(p["number"]): p for p in players}
-        rows = []
-        for record in edited.to_dict("records"):
-            player = by_number.get(int(record["player_num"]))
-            if player is None:
-                continue
-            rows.append({
-                "player_num": int(record["player_num"]),
-                "player_name": record["player_name"],
-                "player_role": str(record["player_role"] or ""),
-            })
-        store.set_lineup(match_id, set_no, rows)
-        # Events already recorded carry a role; push the change through so the
-        # two cannot quietly disagree.
-        store.restamp_roles(match_id, set_no)
-        flash("success", f"Roles saved for set {set_no}")
-        st.rerun()
+    # A callback rather than an inline branch with st.rerun(): one rerun cycle
+    # instead of two, and the video panel is not torn down and rebuilt.
+    st.button("Save roles", key=f"{key}::save", width="stretch",
+              on_click=cb_save_roles, args=(match_id, set_no, edited, players))
 
 
 def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: dict) -> None:

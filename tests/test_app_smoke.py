@@ -714,3 +714,24 @@ def test_saving_roles_does_not_lose_the_video(gated_app, monkeypatch):
     gated_app.run()
     assert not gated_app.exception
     assert seen[-1] == "pcRoX34oP7U"
+
+
+def test_saving_roles_keeps_the_video_and_persists(gated_app, monkeypatch):
+    """The save is a callback now - one rerun, and the panel is not rebuilt."""
+    from volley import store as s
+    from volley import video as video_module
+
+    seen = []
+    monkeypatch.setattr(video_module, "video_panel",
+                        lambda video_id, **kwargs: seen.append(video_id))
+    s.upsert_match({**MATCH, "video_url": "https://youtu.be/pcRoX34oP7U"})
+
+    gated_app.button(key="start_entering").click().run()
+    assert seen[-1] == "pcRoX34oP7U"
+
+    save = next(b.key for b in gated_app.button if b.key.endswith("::save"))
+    gated_app.button(key=save).click().run()
+    assert not gated_app.exception
+    assert seen[-1] == "pcRoX34oP7U"
+    assert any("Roles saved" in m.value for m in gated_app.success)
+    assert s.load_matches().iloc[0]["video_url"] == "https://youtu.be/pcRoX34oP7U"

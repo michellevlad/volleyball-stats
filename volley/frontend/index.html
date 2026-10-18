@@ -109,15 +109,31 @@
     currentVideoId = videoId;
   }
 
+  function loadedVideoId() {
+    try {
+      var data = player && player.getVideoData && player.getVideoData();
+      return (data && data.video_id) || "";
+    } catch (err) {
+      return "";
+    }
+  }
+
   function applyVideo(videoId) {
     if (!videoId) { return; }
+    if (!apiReady) { pendingVideoId = videoId; return; }
+    if (!player) { createPlayer(videoId); return; }
+
     // THE load-bearing check: only touch the player when the id actually
     // changed. Reloading on every render would restart the video on every
     // recorded event and defeat the whole feature.
-    if (videoId === currentVideoId) return;
-    if (!apiReady) { pendingVideoId = videoId; return; }
-    if (!player) { createPlayer(videoId); return; }
+    //
+    // The second half is the recovery: if the frame was rebuilt underneath us
+    // the player can be left holding nothing while we still believe it has the
+    // video. Asking the player what it actually has is the only honest test.
+    if (videoId === currentVideoId && loadedVideoId() === videoId) return;
+
     currentVideoId = videoId;
+    placeholder.style.display = "none";
     player.cueVideoById(videoId);   // cue, not load: never autoplay on a rerun
   }
 
