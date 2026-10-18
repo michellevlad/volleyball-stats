@@ -247,6 +247,26 @@ def current_score(events: pd.DataFrame, match_id: str, set_no: int) -> tuple[int
     return int(last["score_us"]), int(last["score_them"])
 
 
+def manual_score(match_id: str, set_no: int) -> tuple[int, int]:
+    """Where counting the score by hand left off, or 0-0 if it never started.
+
+    Deliberately blind to imported rows: those carry the official score, which
+    is a different thing from the one you are keeping as you watch. A set whose
+    only events came from a protocol has not been counted at all, and starts at
+    nothing.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id)
+        & (events["set_no"] == int(set_no))
+        & (events["source"] == schema.SOURCE_MANUAL)
+    ]
+    if not len(rows):
+        return 0, 0
+    last = rows.sort_values("seq").iloc[-1]
+    return int(last["score_us"]), int(last["score_them"])
+
+
 # --- roster -----------------------------------------------------------------
 
 def load_roster() -> pd.DataFrame:

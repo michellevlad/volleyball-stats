@@ -106,6 +106,12 @@ twice. Your job on the video is everything else:
 - how well each serve was received
 - digs, sets, block touches
 
+**A set carries on to the hitter.** Pick **Set**, then **assist** or **set attempt**, then the
+setter, then who she set it to. An assist stops there — an assist *is* a set that ended in a kill,
+so the kill is written for you. A set attempt asks one more thing, **attack attempt** or **attack
+error**, and writes that too. Two events, one pass through the buttons: you never enter the set and
+the attack separately.
+
 If the protocol is genuinely missing something, switch on **Allow scoring actions** in the sidebar
 and the buttons come back.
 
@@ -161,8 +167,8 @@ is strong; below 2.0 means their serve is dictating the match.
 
 | Result | What happened | Effect |
 |---|---|---|
-| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Records the hitter's kill too; a point for us |
-| **set (0)** | A set that didn't lead to a point. | Nothing |
+| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Asks who it went to, then records the hitter's kill too; a point for us |
+| **set attempt** | A set that didn't lead to a point. | Asks who it went to and how the attack ended, then records that attack too |
 | **error** | A ball-handling fault (double contact, lift) or a set so bad it can't be played. | Point for them |
 
 ### Attack — spiking, trying to score
@@ -221,9 +227,27 @@ after you have already recorded events and those events are updated too, so the 
 
 ### The score
 
-You don't have to keep score by hand. Aces, kills and block points move it automatically, and the
-imported protocol carries the exact score of every point. **+1 us** is there for a point from an
-opponent error, **+1 them** for their points, and you can always type over the numbers.
+The score sits **directly under the video**, in one row, so it is in view while you watch without
+costing the video any width.
+
+A set's score is one of two things, and the switch beside it says which:
+
+**Official** — Profixio's score for that set. It is *shown*, not offered: there is no box to type
+in and no **+1** to press, because the league has already settled it. A set is official the moment
+its protocol has been imported.
+
+**Count as I go** — yours. It starts at **0-0** on a set you haven't counted yet (or wherever your
+own counting had got to, if you are coming back to one), and follows what you record:
+
+| What you record | Score |
+|---|---|
+| kill, ace, block point | **+1 us** |
+| any error — serve, attack, set, dig, block | **+1 them** |
+| reception error | nothing — use **+1 them** |
+| everything else | nothing |
+
+Points that came from an *opponent* mistake have no event of ours at all, so those are **+1 us** by
+hand. You can type over either number whenever you like.
 
 ---
 
@@ -234,6 +258,9 @@ opponent error, **+1 them** for their points, and you can always type over the n
   first** — the same order as Recent, so whatever you just got wrong is the top row of both. That
   is the order you *registered* things in, not set-and-rally order: sets don't finish in the order
   you track them, and the last thing you typed is the thing you want to reach.
+- **The wrong player is fixed in that table.** The **player** cell is a drop-down of everyone in
+  this match's line-up — pick the right one and the event moves to her, shirt number and all. You
+  can change the **#** instead if you prefer; the name then follows the line-up for that set.
 - **Names come from the line-up, never from the roster.** The roster is current; the line-up is who
   wore which shirt *that day*. Shirt numbers get reassigned between matches, so a name looked up by
   number in the roster puts tonight's #4 on the points scored by last month's #4. If a name is wrong
@@ -248,6 +275,11 @@ opponent error, **+1 them** for their points, and you can always type over the n
   | Set 2 | 25-5 | 25-5 | ✅ |
   | Set 3 | 25-6 | — | not entered yet |
   | Result | 3-0 | 2-0 | ⚠️ |
+
+  The check is about **sets you counted yourself** — a ⚠️ there means events went in under the
+  wrong set number, or the set isn't finished, or you missed the **+1 us** on a point that came
+  from an opponent error. A set whose score is **Official** is taking Profixio's own number, so of
+  course it agrees; switch it to **Count as I go** if you want the comparison to test something.
 - Re-importing the protocol is always safe: it replaces only the imported rows and never touches
   anything you entered from the video.
 
@@ -441,6 +473,7 @@ Looker caches; press **Refresh data** after a push if the numbers look old.
 
 ```
 app.py                      The whole interface
+CHANGELOG.md                What changed, version by version
 sync_profixio.py            Season sync and protocol import, from the terminal
 seed_demo.py                Fake data, for trying the app out
 volley/
@@ -467,8 +500,23 @@ read the player clock, and once that was no longer needed it was pure risk: if i
 re-initialise after a rebuild, the panel stayed blank.
 
 ```bash
-.venv/bin/python -m pytest -q      # 228 tests
+.venv/bin/python -m pytest -q      # 313 tests
 ```
+
+### Releasing
+
+The version lives in one place, `volley/__init__.py`, and is shown at the bottom of the sidebar so
+a running app can always be matched to an entry in `CHANGELOG.md`.
+
+**Every pull request that changes behaviour bumps it**, in the same commit as the change:
+
+1. Bump `__version__` — a new feature moves the minor number, a fix the patch one. The app is
+   pre-1.0, so neither is a promise about compatibility yet.
+2. Add the matching `## [x.y.z] - YYYY-MM-DD` section to `CHANGELOG.md`, written for someone using
+   the app rather than someone reading the diff.
+
+`tests/test_version.py` fails if the two disagree, which is the whole reason it exists: forgetting
+is silent otherwise.
 
 The Profixio parsers are tested against **real recorded output** — an actual season page and a real
 Arbetsprotokoll — asserting known-good numbers: 16 fixtures, 11 players, 110 protocol rows, 75–20
