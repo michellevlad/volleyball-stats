@@ -36,9 +36,18 @@ def test_parse_youtube_id_rejects(url):
 def test_the_panel_is_declared_against_the_real_frontend():
     assert (video.FRONTEND_DIR / "index.html").exists()
     html = (video.FRONTEND_DIR / "index.html").read_text()
-    # The panel is one-way now: it plays, and tells Python nothing.
+
+    # One-way: it plays, and tells Python nothing.
     assert "setComponentValue" not in html
-    # ...but it must still survive a rerun, which is the whole reason it is a
-    # custom component rather than an iframe.
-    assert "videoId === currentVideoId" in html
+    # It must still survive a rerun - the whole reason this is a component
+    # rather than an st.video call - so the src is only touched when the id
+    # actually changes.
+    assert "videoId === current" in html
     assert "componentReady" in html
+
+    # No YouTube IFrame API. It only existed to read the player clock, which
+    # nothing needs now, and it was the part that could fail to re-initialise
+    # after Streamlit rebuilt the frame and leave the panel blank for good.
+    for fragile in ("iframe_api", "onYouTubeIframeAPIReady", "YT.Player"):
+        assert fragile not in html, f"{fragile} is back"
+    assert "youtube.com/embed/" in html

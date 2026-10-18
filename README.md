@@ -71,11 +71,14 @@ This is the screen you land on. Nothing can be entered until you have been throu
 The video sits across the top. Underneath it are the buttons: **tap the player, tap the action,
 tap the result.** Three taps and it is recorded.
 
+Click the video once, then YouTube's own shortcuts work:
+
 | key | what it does |
 |---|---|
-| `space` | play / pause |
-| `←` `→` | jump back / forward 5 seconds |
-| `shift` + `←` `→` | 1 second, for when it's close |
+| `k` or `space` | play / pause |
+| `j` `l` | jump back / forward 10 seconds |
+| `←` `→` | 5 seconds |
+| `,` `.` | one frame, when paused |
 
 There is nothing to type. The buttons are the only way in, so there is no shorthand to remember and
 nothing that can be mistyped.
@@ -365,8 +368,9 @@ loses nothing. Google Sheets is only involved when you press push.
 
 **Why the video panel is a custom component:** Streamlit re-runs the whole page on every click. A
 normal embedded video would restart each time you recorded a kill. A custom component keeps its
-frame alive across re-runs, and it is also the only way to read the player's clock — which is what
-lets every event know where it is in the video.
+frame alive across re-runs. Inside it is a plain YouTube embed — the IFrame API was only there to
+read the player clock, and once that was no longer needed it was pure risk: if its script failed to
+re-initialise after a rebuild, the panel stayed blank.
 
 ```bash
 .venv/bin/python -m pytest -q      # 228 tests
