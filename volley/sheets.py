@@ -375,6 +375,99 @@ def _merge_lineup(spreadsheet, lineup: pd.DataFrame) -> pd.DataFrame:
     return merged.drop_duplicates(["match_id", "set_no", "player_num"], keep="first")
 
 
+NUMERIC_STAT_COLUMNS = ("set_no", "player_num", "sets_played")
+
+
+def upsert_by_match(spreadsheet, title: str, df: pd.DataFrame, columns: list[str]) -> int:
+    """Replace the rows for the matches we hold; leave every other match alone.
+
+    An aggregate row is a summary, not a fact - it changes as you enter more -
+    so it has to be rewritten rather than appended. But rewriting the *whole*
+    tab makes it a mirror of this one machine: lose the local buffer, push, and
+    the sheet empties with it. Scoping the rewrite to the matches present
+    locally keeps corrections and deletions working inside a match while a
+    match this machine has never seen simply stays where it is.
+    """
+    remote = read_tab(spreadsheet, title, columns)
+    ours = set(df["match_id"]) if len(df) else set()
+    kept = remote[~remote["match_id"].isin(ours)] if len(remote) else remote
+
+    merged = store.concat_frames([kept, df]).reindex(columns=columns)
+    if len(merged):
+        for column in NUMERIC_STAT_COLUMNS:
+            if column in merged.columns:
+                merged[column] = (
+                    pd.to_numeric(merged[column], errors="coerce").fillna(0).astype(int)
+                )
+        sort_by = [c for c in ("match_date", "match_id", "set_no", "player_num")
+                   if c in merged.columns]
+        merged = merged.sort_values(sort_by)
+
+    replace_tab(spreadsheet, title, merged, columns)
+    return len(merged)
+
+
+def mirror_rows_by_id(worksheet, df: pd.DataFrame, columns: list[str],
+                      scope_column: str = "match_id",
+                      id_column: str = "event_id") -> dict:
+    """Make the sheet match this machine, for the matches this machine holds.
+
+    One rule, the same as the per-set table: **a match you hold locally is
+    mirrored; a match you do not hold is left exactly as it is.**
+
+    That means corrections reach rows written months ago, and events you delete
+    stop coming back - without which Restore from Sheets would resurrect
+    everything Review duplicates had just removed. A match this machine has
+    never seen is untouched, which is what makes the archive worth keeping.
+
+    Columns the app does not know about are carried across untouched.
+    """
+    headers = ensure_columns(worksheet, columns)
+    existing = worksheet.get_all_values()
+    if len(existing) < 1:
+        return {"added": append_mapped(worksheet, df, columns), "updated": 0, "removed": 0}
+
+    id_at, scope_at = headers.index(id_column), headers.index(scope_column)
+
+    def cell(row, index):
+        return row[index] if index < len(row) else ""
+
+    local_by_id = {str(r.get(id_column, "")): r for r in df.to_dict("records")}
+    local_scopes = set(df[scope_column].astype(str)) if len(df) else set()
+
+    kept, updated, removed, seen = [], 0, 0, set()
+    for row in existing[1:]:
+        key = cell(row, id_at)
+        if not key and not any(c.strip() for c in row):
+            continue
+        record = local_by_id.get(key)
+        if record is None:
+            # Only drop it if this machine owns that match; otherwise it is
+            # someone else's work, or a match we simply do not have.
+            if cell(row, scope_at) in local_scopes:
+                removed += 1
+                continue
+            kept.append([cell(row, i) for i in range(len(headers))])
+            continue
+        seen.add(key)
+        merged = [
+            _cell(record.get(header, "")) if header in columns else cell(row, index)
+            for index, header in enumerate(headers)
+        ]
+        if [str(v) for v in merged] != [str(cell(row, i)) for i in range(len(headers))]:
+            updated += 1
+        kept.append(merged)
+
+    fresh = [record for key, record in local_by_id.items() if key not in seen]
+    for record in fresh:
+        kept.append([_cell(record.get(header, "")) for header in headers])
+
+    worksheet.resize(rows=max(len(kept) + 1, 2), cols=max(len(headers), 1))
+    worksheet.clear()
+    worksheet.update(values=[headers] + kept, range_name="A1")
+    return {"added": len(fresh), "updated": updated, "removed": removed}
+
+
 def read_events(spreadsheet, title: str | None = None) -> pd.DataFrame:
     """Read the archived raw events back out of the spreadsheet.
 
@@ -409,6 +502,7 @@ def push(spreadsheet, events: pd.DataFrame, matches: pd.DataFrame,
     wanted = config.push_tabs()
     mapping = mapping or {}
     written = {}
+    corrected = removed = 0
 
     for column in ("set_no", "seq", "player_num", "score_us", "score_them"):
         if column in events.columns:
@@ -417,20 +511,20 @@ def push(spreadsheet, events: pd.DataFrame, matches: pd.DataFrame,
             )
 
     if schema.TAB_SET_STATS in wanted:
-        per_set = stats.player_set_stats(events)
-        replace_tab(spreadsheet, schema.TAB_SET_STATS, per_set, schema.SET_STATS_COLUMNS)
-        written[schema.TAB_SET_STATS] = len(per_set)
+        written[schema.TAB_SET_STATS] = upsert_by_match(
+            spreadsheet, schema.TAB_SET_STATS,
+            stats.player_set_stats(events), schema.SET_STATS_COLUMNS,
+        )
 
     # The rest are opt-in, and behave as they always did.
     if schema.TAB_EVENTS in wanted:
         title = mapping.get("events", schema.TAB_EVENTS)
         get_or_create(spreadsheet, title, schema.EVENT_COLUMNS)
-        remote = read_tab(spreadsheet, title, schema.EVENT_COLUMNS)
-        already = set(remote["event_id"]) if len(remote) else set()
-        fresh = events[~events["event_id"].isin(already)]
-        written[schema.TAB_EVENTS] = append_mapped(
-            spreadsheet.worksheet(title), fresh, schema.EVENT_COLUMNS
+        outcome = mirror_rows_by_id(
+            spreadsheet.worksheet(title), events, schema.EVENT_COLUMNS
         )
+        written[schema.TAB_EVENTS] = outcome["added"] + outcome["updated"]
+        corrected, removed = outcome["updated"], outcome["removed"]
 
     if schema.TAB_MATCHES in wanted:
         title = mapping.get("matches", schema.TAB_MATCHES)
@@ -462,6 +556,8 @@ def push(spreadsheet, events: pd.DataFrame, matches: pd.DataFrame,
 
     return {
         "tabs": written,
+        "corrected": corrected,
+        "removed": removed,
         "rows": sum(written.values()),
         "events_total": len(events),
         "pushed_ids": list(events["event_id"]) if "event_id" in events.columns else [],

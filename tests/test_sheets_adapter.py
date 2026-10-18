@@ -36,6 +36,10 @@ class FakeWorksheet:
             for col_offset, cell in enumerate(incoming):
                 line[col - 1 + col_offset] = cell
 
+    def batch_update(self, updates, **kwargs):
+        for update in updates:
+            self.update(values=update["values"], range_name=update["range"])
+
     def append_rows(self, rows, **kwargs):
         self.values.extend([list(row) for row in rows])
 
@@ -189,7 +193,8 @@ def make_events(n=2, match_id="m1", set_no=1):
             "match_name": "Elden VBK vs Lions", "set_no": set_no,
             "player_num": 7, "player_name": "Ana", "player_role": "OH",
             "action": schema.ATTACK, "action_result": "kill", "is_point": True,
-            "source": schema.SOURCE_MANUAL, "event_id": f"e{set_no}-{index}",
+            "source": schema.SOURCE_MANUAL,
+            "event_id": f"{match_id}-s{set_no}-{index}",
             "seq": index + 1, "score_us": index + 1, "score_them": 0,
         })
     return pd.DataFrame(rows, columns=schema.EVENT_COLUMNS)
@@ -214,10 +219,22 @@ def set_stats_rows(spreadsheet):
     return [dict(zip(tab.values[0], row)) for row in tab.values[1:]]
 
 
-def test_push_writes_only_the_per_set_table(spreadsheet):
+def test_push_writes_the_table_the_archive_and_the_match_sheet(spreadsheet):
+    result = sheets.push(spreadsheet, make_events(2), make_matches())
+    assert set(result["tabs"]) == {
+        schema.TAB_SET_STATS, schema.TAB_EVENTS, schema.TAB_MATCHES
+    }
+    assert set(spreadsheet.tabs) == {
+        "Eventos", schema.TAB_SET_STATS, schema.TAB_EVENTS, schema.TAB_MATCHES
+    }
+
+
+def test_the_per_set_table_alone_is_still_possible(spreadsheet, monkeypatch):
+    from volley import config
+
+    monkeypatch.setattr(config, "push_tabs", lambda: [schema.TAB_SET_STATS])
     result = sheets.push(spreadsheet, make_events(2), make_matches())
     assert list(result["tabs"]) == [schema.TAB_SET_STATS]
-    assert set(spreadsheet.tabs) == {"Eventos", schema.TAB_SET_STATS}
 
 
 def test_the_per_set_table_has_the_expected_shape(spreadsheet):
@@ -279,9 +296,10 @@ def test_events_can_be_archived_as_well(spreadsheet, monkeypatch):
     assert set(result["tabs"]) == {schema.TAB_SET_STATS, schema.TAB_EVENTS}
     assert result["tabs"][schema.TAB_EVENTS] == 2
 
-    # ...and that one *is* deduplicated, because it appends.
+    # ...and nothing is added twice when the same events are pushed again.
     again = sheets.push(spreadsheet, make_events(2), make_matches())
     assert again["tabs"][schema.TAB_EVENTS] == 0
+    assert again["corrected"] == 0
 
 
 # --- auth failure messages --------------------------------------------------
@@ -414,8 +432,11 @@ def test_events_can_be_read_back_out_of_the_sheet(spreadsheet, monkeypatch):
     assert bool(back["is_point"].iloc[0]) is True
 
 
-def test_reading_back_without_the_archive_gives_nothing(spreadsheet):
-    """Only PlayerSetStats was pushed - an aggregate cannot be reversed."""
+def test_reading_back_without_the_archive_gives_nothing(spreadsheet, monkeypatch):
+    """An aggregate cannot be reversed, so without Events there is nothing."""
+    from volley import config
+
+    monkeypatch.setattr(config, "push_tabs", lambda: [schema.TAB_SET_STATS])
     sheets.push(spreadsheet, make_events(3), make_matches())
     assert len(sheets.read_events(spreadsheet)) == 0
 
@@ -479,3 +500,140 @@ def test_a_restored_match_rebuilds_the_same_per_set_table(temp_store, monkeypatc
     pd.testing.assert_frame_equal(
         expected.reset_index(drop=True), restored.reset_index(drop=True)
     )
+
+
+# --- the per-set table is upserted, not mirrored ----------------------------
+
+def test_a_match_this_machine_has_never_seen_survives_a_push(spreadsheet):
+    """Losing the local buffer must not empty the dashboard."""
+    sheets.push(spreadsheet, make_events(2, match_id="m1"), make_matches("m1"))
+    sheets.push(spreadsheet, make_events(3, match_id="m2"), make_matches("m2"))
+
+    rows = set_stats_rows(spreadsheet)
+    assert {r["match_id"] for r in rows} == {"m1", "m2"}
+    assert {r["match_id"]: r["kills"] for r in rows} == {"m1": 2, "m2": 3}
+
+
+def test_pushing_nothing_does_not_wipe_the_sheet(spreadsheet):
+    sheets.push(spreadsheet, make_events(3), make_matches())
+    before = set_stats_rows(spreadsheet)
+
+    empty = pd.DataFrame(columns=schema.EVENT_COLUMNS)
+    sheets.push(spreadsheet, empty, pd.DataFrame(columns=schema.MATCH_COLUMNS))
+    assert set_stats_rows(spreadsheet) == before
+
+
+def test_a_correction_inside_a_match_still_lands(spreadsheet):
+    """Within a match the local data is authoritative, deletions included."""
+    sheets.push(spreadsheet, make_events(3, match_id="m1"), make_matches("m1"))
+    assert set_stats_rows(spreadsheet)[0]["kills"] == 3
+
+    sheets.push(spreadsheet, make_events(1, match_id="m1"), make_matches("m1"))
+    rows = set_stats_rows(spreadsheet)
+    assert len(rows) == 1 and rows[0]["kills"] == 1
+
+
+def test_a_player_dropped_from_a_match_is_dropped_from_the_sheet(spreadsheet):
+    two = pd.concat([make_events(1, match_id="m1"),
+                     make_events(1, match_id="m1").assign(player_num=9,
+                                                          player_name="Bea",
+                                                          event_id="other")],
+                    ignore_index=True)
+    sheets.push(spreadsheet, two, make_matches("m1"))
+    assert len(set_stats_rows(spreadsheet)) == 2
+
+    sheets.push(spreadsheet, make_events(1, match_id="m1"), make_matches("m1"))
+    rows = set_stats_rows(spreadsheet)
+    assert len(rows) == 1 and rows[0]["player_num"] == 7
+
+
+def test_rows_come_back_in_a_stable_order(spreadsheet):
+    sheets.push(spreadsheet, make_events(1, match_id="m2", set_no=2), make_matches("m2"))
+    sheets.push(spreadsheet, make_events(1, match_id="m1", set_no=1), make_matches("m1"))
+    rows = set_stats_rows(spreadsheet)
+    assert [(r["match_id"], r["set_no"]) for r in rows] == [("m1", 1), ("m2", 2)]
+
+
+def test_a_push_never_touches_a_tab_it_does_not_own():
+    """Hand-kept tabs must survive a push untouched, whatever they contain."""
+    theirs = [
+        ["Date", "Match Name", "Set ", "Number Player", "Name Player"],
+        ["2026-09-26", "Uppsala F - Elden B", "1", "25", "Audrey"],
+    ]
+    roster_tab = [["Roaster"]]
+    spreadsheet = FakeSpreadsheet({"Track_Stats": theirs, "Roaster": roster_tab,
+                                   "Team": [["Number", "Name"]]})
+
+    sheets.push(spreadsheet, make_events(3), make_matches(),
+                {"roster": "Roster", "matches": "Matches", "events": "Events"})
+
+    assert "Track_Stats" in spreadsheet.tabs, "a hand-kept tab was deleted"
+    assert "Roaster" in spreadsheet.tabs, "a hand-kept tab was deleted"
+    assert spreadsheet.worksheet("Track_Stats").values == theirs
+    assert spreadsheet.worksheet("Roaster").values == roster_tab
+    assert spreadsheet.worksheet("Team").values == [["Number", "Name"]]
+
+
+# --- the archive corrects itself --------------------------------------------
+
+def test_a_corrected_name_reaches_rows_already_in_the_sheet(spreadsheet):
+    """Append-only was not enough: a row written months ago kept the old name."""
+    events = make_events(2)
+    sheets.push(spreadsheet, events, make_matches())
+    tab = spreadsheet.worksheet(schema.TAB_EVENTS)
+    assert {dict(zip(tab.values[0], r))["player_name"] for r in tab.values[1:]} == {"Ana"}
+
+    corrected = events.assign(player_name="Nadia")
+    result = sheets.push(spreadsheet, corrected, make_matches())
+    assert result["corrected"] == 2
+    assert result["tabs"][schema.TAB_EVENTS] == 2
+
+    rows = [dict(zip(tab.values[0], r)) for r in tab.values[1:]]
+    assert {r["player_name"] for r in rows} == {"Nadia"}
+    assert len(rows) == 2, "correcting must not duplicate the row"
+
+
+def test_deleting_an_event_locally_removes_it_from_the_archive(spreadsheet):
+    """Otherwise Restore would resurrect everything Review duplicates removed."""
+    sheets.push(spreadsheet, make_events(3, match_id="m1"), make_matches("m1"))
+    result = sheets.push(spreadsheet, make_events(1, match_id="m1"), make_matches("m1"))
+
+    assert result["removed"] == 2
+    tab = spreadsheet.worksheet(schema.TAB_EVENTS)
+    assert len(tab.values) - 1 == 1
+
+
+def test_a_match_this_machine_does_not_hold_is_left_alone(spreadsheet):
+    """That is what makes the archive survive a local loss."""
+    sheets.push(spreadsheet, make_events(3, match_id="m1"), make_matches("m1"))
+    result = sheets.push(spreadsheet, make_events(2, match_id="m2"), make_matches("m2"))
+
+    assert result["removed"] == 0
+    rows = [dict(zip(spreadsheet.worksheet(schema.TAB_EVENTS).values[0], r))
+            for r in spreadsheet.worksheet(schema.TAB_EVENTS).values[1:]]
+    assert sorted(r["match_id"] for r in rows) == ["m1"] * 3 + ["m2"] * 2
+
+
+def test_an_unchanged_push_writes_nothing(spreadsheet):
+    events = make_events(3)
+    sheets.push(spreadsheet, events, make_matches())
+    before = [list(row) for row in spreadsheet.worksheet(schema.TAB_EVENTS).values]
+
+    result = sheets.push(spreadsheet, events, make_matches())
+    assert result["corrected"] == 0
+    assert [list(r) for r in spreadsheet.worksheet(schema.TAB_EVENTS).values] == before
+
+
+def test_columns_the_app_does_not_know_about_survive_a_correction():
+    worksheet = FakeWorksheet("Events", [
+        schema.EVENT_COLUMNS + ["Comentario"],
+        ["m1", "2026-09-27", "Elden VBK vs Lions", "1", "7", "Ana", "OH",
+         schema.ATTACK, "kill", "True", "", schema.SOURCE_MANUAL, "m1-s1-0", "1", "1", "0",
+         "from the pipe"],
+    ])
+    corrected = make_events(1).assign(player_name="Nadia")
+    sheets.mirror_rows_by_id(worksheet, corrected, schema.EVENT_COLUMNS)
+
+    row = dict(zip(worksheet.values[0], worksheet.values[1]))
+    assert row["player_name"] == "Nadia"
+    assert row["Comentario"] == "from the pipe"

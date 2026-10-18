@@ -38,8 +38,9 @@ def init_state() -> None:
     defaults = {
         "match_id": "",
         "set_no": 1,
-        "sel_player": None,
         "sel_action": None,
+        "sel_result": None,
+        "sel_player": None,
         "flash": None,
         "spreadsheet": None,
         "spreadsheet_title": "",
@@ -52,10 +53,16 @@ def init_state() -> None:
         "setup_done_for": "",
         "connect_attempted": False,
         "auth_command": "",
-        "allow_scoring": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+    # Rows written before events carried a registration stamp need one, or they
+    # would all sort together at the bottom. Runs once per session and does
+    # nothing at all once every row is stamped.
+    if not st.session_state.get("backfilled"):
+        store.backfill_recorded_at()
+        st.session_state["backfilled"] = True
 
 
 def flash(kind: str, message: str) -> None:
@@ -67,12 +74,19 @@ def score_keys(match_id: str, set_no: int) -> tuple[str, str]:
 
 
 def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None:
-    """Seed the score widgets from the last event of the set (survives a restart)."""
+    """Seed the score widgets, preferring the official record.
+
+    A set with a protocol already has a score for every point, so take it. The
+    running total only has to be maintained by hand when there is nothing
+    official to take it from.
+    """
     us_key, them_key = score_keys(match_id, set_no)
-    if us_key not in st.session_state or them_key not in st.session_state:
-        us, them = store.current_score(events, match_id, set_no)
-        st.session_state.setdefault(us_key, us)
-        st.session_state.setdefault(them_key, them)
+    if us_key in st.session_state and them_key in st.session_state:
+        return
+    official = store.protocol_score(match_id, set_no)
+    us, them = official if official else store.current_score(events, match_id, set_no)
+    st.session_state.setdefault(us_key, us)
+    st.session_state.setdefault(them_key, them)
 
 
 def current_video_id() -> str | None:
@@ -81,31 +95,25 @@ def current_video_id() -> str | None:
 
 # --- recording --------------------------------------------------------------
 
-def scoring_is_locked(match_id: str, action: str, result: str) -> bool:
-    """Point-scoring actions belong to the protocol once it has been imported."""
-    if st.session_state.get("allow_scoring"):
-        return False
-    if not schema.is_point(action, result):
-        return False
-    return store.has_profixio_events(match_id)
+def record(match: dict, player: dict, action: str, result: str, target_num=None) -> dict:
+    """Move the score, write one event, and hand back the row that was written.
 
-
-def commit(match: dict, player: dict, action: str, result: str) -> None:
+    Separate from `commit` because an assist records two events and they have
+    to share one selection reset and one message. Each call re-reads the buffer
+    so a second event gets the next `seq` rather than colliding with the first.
+    """
     match_id = match["match_id"]
     set_no = int(st.session_state.set_no)
-
-    if scoring_is_locked(match_id, action, result):
-        flash(
-            "error",
-            f"`{action.lower()} {result}` is already in this match from the official "
-            "protocol. Record the attempts, errors, receptions and digs instead - or "
-            "switch on *Allow scoring actions* in the sidebar if the protocol missed it.",
-        )
-        return
-
     us_key, them_key = score_keys(match_id, set_no)
-    if schema.is_point(action, result):
-        st.session_state[us_key] = int(st.session_state[us_key]) + 1
+
+    # With an official protocol the score is already known for every point, so
+    # recording an action never moves it - that is what stops a correction from
+    # also inflating the set. Without one, keep count as you go.
+    if store.protocol_score(match_id, set_no) is None:
+        if schema.is_point(action, result):
+            st.session_state[us_key] = int(st.session_state[us_key]) + 1
+        elif result == "error":
+            st.session_state[them_key] = int(st.session_state[them_key]) + 1
 
     events = store.load_events()
     event = store.build_event(
@@ -118,41 +126,83 @@ def commit(match: dict, player: dict, action: str, result: str) -> None:
         score_us=int(st.session_state[us_key]),
         score_them=int(st.session_state[them_key]),
         role=store.role_of(match_id, set_no, player["number"], player.get("position", "")),
+        target_num=target_num,
     )
     store.append_event(event)
-    st.session_state.sel_player = None
+    return event
+
+
+def describe(event: dict) -> str:
+    to = f" → #{event['target_num']}" if event["target_num"] not in ("", None) else ""
+    return (f"#{event['player_num']} {event['player_name']} · "
+            f"{event['action'].lower()} {event['action_result']}{to}")
+
+
+def clear_selection() -> None:
     st.session_state.sel_action = None
-    flash("success",
-          f"#{event['player_num']} {event['player_name']} · {action.lower()} {result}")
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
+
+
+def commit(match: dict, player: dict, action: str, result: str, target_num=None) -> None:
+    event = record(match, player, action, result, target_num)
+    clear_selection()
+    flash("success", describe(event))
 
 
 # --- callbacks (run before the script reruns) ------------------------------
 
-def cb_pick_player(player: dict) -> None:
-    st.session_state.sel_player = player
-    st.session_state.sel_action = None
-
-
 def cb_pick_action(action: str) -> None:
     st.session_state.sel_action = action
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
 
 
-def cb_pick_result(match: dict, result: str) -> None:
-    player = st.session_state.sel_player
+def cb_pick_result(result: str) -> None:
+    st.session_state.sel_result = result
+    st.session_state.sel_player = None
+
+
+def cb_pick_player(match: dict, player: dict) -> None:
+    """The player tap commits - unless it is an assist, which needs a target."""
     action = st.session_state.sel_action
-    if player and action:
-        commit(match, player, action, result)
+    result = st.session_state.sel_result
+    if not action or not result:
+        return
+    if action == schema.SET and result == "assist":
+        st.session_state.sel_player = player
+        return
+    commit(match, player, action, result)
+
+
+def cb_pick_target(match: dict, target: dict) -> None:
+    """The setter's assist and the hitter's kill, from the one tap.
+
+    An assist is by definition a set that ended in a kill, so the kill is
+    recorded too rather than asked for a second time. The protocol may already
+    hold that kill; recording it anyway is deliberate, because the point of
+    entering by hand is to complete what Profixio missed. A genuine double is
+    settled once in Review duplicates, which now remembers what you decided.
+    """
+    setter = st.session_state.sel_player
+    if not setter:
+        return
+    assist = record(match, setter, schema.SET, "assist",
+                    target_num=int(target["number"]))
+    kill = record(match, target, schema.ATTACK, "kill")
+    clear_selection()
+    flash("success", f"{describe(assist)}  ·  {describe(kill)}")
 
 
 def cb_clear_selection() -> None:
-    st.session_state.sel_player = None
-    st.session_state.sel_action = None
+    clear_selection()
 
 
 def cb_goto_set(set_no: int) -> None:
     st.session_state.set_no = int(set_no)
-    st.session_state.sel_player = None
     st.session_state.sel_action = None
+    st.session_state.sel_result = None
+    st.session_state.sel_player = None
 
 
 def cb_bump(key: str, delta: int) -> None:
@@ -196,11 +246,50 @@ def cb_reopen_setup() -> None:
     st.session_state.setup_done_for = ""
 
 
-def cb_start_entering(match_id: str, numbers: list) -> None:
-    """Save the squad from the checkboxes and open the workspace."""
-    picked = [n for n in numbers if st.session_state.get(f"squad::{match_id}::{n}")]
-    store.set_squad(match_id, picked)
+def cb_start_entering(match_id: str) -> None:
+    """Save the one squad table and open the workspace."""
+    save_squad(match_id)
     st.session_state.setup_done_for = match_id
+
+
+def apply_edits(rows: list, edits: dict) -> list:
+    """Fold a data editor's edits back into the rows it was built from.
+
+    Streamlit reports them as {"edited_rows": {row index: {column: value}}} -
+    only what changed, positioned by row. Kept separate from the callback so it
+    can be tested without a script run.
+    """
+    merged = [dict(row) for row in rows]
+    for index, changed in (edits or {}).items():
+        index = int(index)
+        if 0 <= index < len(merged):
+            merged[index].update(
+                {key: value for key, value in changed.items() if key in merged[index]}
+            )
+    return merged
+
+
+def cb_roles_changed(match_id: str, set_no: int, rows: list, key: str) -> None:
+    """Save a role the moment it is picked.
+
+    A separate Save button was a step too many - you change the dropdown and
+    expect it to be changed.
+    """
+    edits = (st.session_state.get(key) or {}).get("edited_rows", {})
+    if not edits:
+        return
+    store.set_lineup(match_id, set_no, [
+        {
+            "player_num": int(row["player_num"]),
+            "player_name": row["player_name"],
+            "player_role": str(row["player_role"] or ""),
+        }
+        for row in apply_edits(rows, edits)
+    ])
+    # Events already recorded carry the name and role as they were when you
+    # tapped; push the correction through so the two cannot quietly disagree.
+    store.restamp_players(match_id, set_no)
+    store.restamp_roles(match_id, set_no)
 
 
 def cb_save_video_url(match: dict) -> None:
@@ -281,8 +370,14 @@ def sidebar_connection() -> None:
             "unknown columns are left alone \u2014 nothing here is ever rewritten."
         )
         titles = st.session_state.tab_titles
-        chosen = {}
-        for role, default_title in schema.MAPPABLE_ROLES.items():
+        chosen = dict(st.session_state.mapping)
+        # Only the tabs a push actually writes can be mapped; the rest would be
+        # a choice with no effect.
+        writable = {
+            role: title for role, title in schema.MAPPABLE_ROLES.items()
+            if title in config.push_tabs()
+        }
+        for role, default_title in writable.items():
             options = list(titles)
             new_option = f"\u2795 create \u201c{default_title}\u201d"
             if default_title not in options:
@@ -368,14 +463,11 @@ def sidebar_match(matches: pd.DataFrame) -> None:
         st.session_state.setup_done_for = ""
         st.rerun()
 
-    st.sidebar.radio("Set", [1, 2, 3, 4, 5], key="set_no", horizontal=True)
-
-    if store.has_profixio_events(st.session_state.match_id):
-        st.sidebar.toggle(
-            "Allow scoring actions", key="allow_scoring",
-            help="The official protocol already has every point. Switch this on only "
-                 "if it is missing something.",
-        )
+    # No set control here. It used to be a sidebar radio, and because the
+    # workspace is a fragment the sidebar is not re-rendered when you tap
+    # inside it - so the radio went stale and snapped back to set 1 on the next
+    # full rerun, quietly filing events against the wrong set. The set strip
+    # under the score is inside the fragment and owns this now.
 
     st.sidebar.subheader("Video")
     st.sidebar.toggle("Show video", key="show_video")
@@ -476,8 +568,10 @@ def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
         theirs = official_by_set.get(number)
         if mine and theirs and mine == theirs:
             label = f"Set {number} ✅"
+        elif mine and theirs:
+            label = f"Set {number} · {mine} vs {theirs}"
         elif mine:
-            label = f"Set {number} ·"
+            label = f"Set {number} · {mine}"
         else:
             label = f"Set {number}"
         columns[index].button(
@@ -501,7 +595,8 @@ def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
         width="stretch",
         disabled=set_no >= 5,
         type="primary" if matches_official else "secondary",
-        help="Start entering the next set. The line-up carries over.",
+        help="Nothing marks a set finished - it shows ✅ once what you entered "
+             "matches the official score. The line-up carries over.",
     )
     if matches_official:
         st.caption(f"Set {set_no} matches the official {theirs} — ready for the next one.")
@@ -546,35 +641,36 @@ def player_label(player: dict, squad: list) -> str:
     return f"#{int(player['number'])} {first}".strip()
 
 
+def _player_row(squad: list, match: dict, caption: str, callback, exclude=None) -> None:
+    st.caption(caption)
+    shown = [p for p in squad if exclude is None or int(p["number"]) != int(exclude)]
+    per_row = min(8, max(4, len(shown)))
+    columns = st.columns(per_row)
+    for index, player in enumerate(shown):
+        columns[index % per_row].button(
+            player_label(player, squad),
+            key=f"player::p{int(player['number'])}" if exclude is None
+                else f"target::p{int(player['number'])}",
+            on_click=callback,
+            args=(match, player),
+            width="stretch",
+        )
+
+
 def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
-    """Player -> action -> result, three taps, meant to sit under the video."""
-    players = store.squad_players(roster, match)
+    """Action, then result, then player.
+
+    The action row never changes, so it is always in the same place; the player
+    row - the one that differs between matches - comes last, by which point the
+    name is already known.
+    """
+    players = store.squad_players(roster, match, int(st.session_state.set_no))
     if not len(players):
         st.warning("Nobody called up. Reopen Match setup to pick the squad.")
         return
-
     squad = players.to_dict("records")
-    selected = st.session_state.sel_player
 
-    st.caption("Player")
-    per_row = min(8, max(4, len(squad)))
-    columns = st.columns(per_row)
-    for index, player in enumerate(squad):
-        is_selected = bool(selected and selected["player_id"] == player["player_id"])
-        columns[index % per_row].button(
-            player_label(player, squad),
-            key=f"player::{player['player_id']}",
-            on_click=cb_pick_player,
-            args=(player,),
-            width="stretch",
-            type="primary" if is_selected else "secondary",
-        )
-
-    if not selected:
-        st.caption("Pick a player to see the actions.")
-        return
-
-    st.caption(f"Action · #{selected['number']} {selected['name']}")
+    st.caption("Action")
     action_columns = st.columns(len(schema.ACTION_ORDER) + 1)
     for index, action in enumerate(schema.ACTION_ORDER):
         action_columns[index].button(
@@ -586,29 +682,61 @@ def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
             type="primary" if st.session_state.sel_action == action else "secondary",
         )
     action_columns[-1].button(
-        "✕", key="cancel", on_click=cb_clear_selection, width="stretch", help="Cancel"
+        "✕", key="cancel", on_click=cb_clear_selection, width="stretch", help="Start over"
     )
 
     action = st.session_state.sel_action
     if not action:
+        st.caption("Pick an action to see its results.")
         return
 
     st.caption(f"Result · {action.title()}")
     results = schema.ACTIONS[action]
     result_columns = st.columns(len(results))
     for index, result in enumerate(results):
-        locked = scoring_is_locked(st.session_state.match_id, action, result)
         result_columns[index].button(
             schema.result_label(action, result),
             key=f"result::{action}::{result}",
             on_click=cb_pick_result,
-            args=(match, result),
+            args=(result,),
             width="stretch",
-            type="secondary" if locked else "primary",
-            disabled=locked,
-            help="Already imported from the official protocol" if locked else None,
+            type="primary" if st.session_state.sel_result == result else "secondary",
         )
 
+    result = st.session_state.sel_result
+    if not result:
+        return
+
+    # Which players already have this from the official record, shown before
+    # you tap rather than after - the point is to prevent the double entry, not
+    # to report it once it has happened.
+    if schema.is_point(action, result):
+        have = []
+        for player in squad:
+            count = store.protocol_count(
+                match["match_id"], st.session_state.set_no, player["number"], action
+            )
+            if count:
+                have.append(f"#{int(player['number'])}×{count}")
+        if have:
+            st.caption(
+                f"The official protocol already has {action.lower()} points for "
+                + " · ".join(have)
+                + " — only add one if the protocol got it wrong."
+            )
+
+    assist = action == schema.SET and result == "assist"
+    chosen = st.session_state.sel_player
+    if not (assist and chosen):
+        _player_row(squad, match, f"Player · {action.lower()} {result}", cb_pick_player)
+
+    # An assist needs one more tap: who it was set to.
+    if assist and chosen:
+        _player_row(
+            squad, match,
+            f"#{chosen['number']} {chosen['name']} set it to…",
+            cb_pick_target, exclude=chosen["number"],
+        )
 
 def entry_panel(roster: pd.DataFrame, match: dict) -> None:
     entry_buttons(roster, match)
@@ -660,12 +788,12 @@ def box_score(match_events: pd.DataFrame, matches: pd.DataFrame, match: dict) ->
 
 
 def recent_events(match_events: pd.DataFrame) -> None:
+    """The last dozen, newest first - what you just did is at the top."""
     st.subheader("Recent")
     if not len(match_events):
         st.caption("Nothing entered yet.")
         return
-    ordered = match_events.sort_values(["set_no", "seq"]).tail(12).iloc[::-1]
-    for event in ordered.to_dict("records"):
+    for event in match_events.to_dict("records"):
         line, undo = st.columns([7, 1])
         line.write(
             f"S{event['set_no']} · #{event['player_num']} {event['player_name']} · "
@@ -677,12 +805,16 @@ def recent_events(match_events: pd.DataFrame) -> None:
         )
 
 
-def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
+def full_editor(match_events: pd.DataFrame, match_id: str) -> None:
     with st.expander(f"Edit all {len(match_events)} events of this match"):
         if not len(match_events):
             st.caption("Nothing to edit.")
             return
-        display = match_events[schema.EVENT_COLUMNS].copy()
+        # Newest first, in the order you registered them - the same order as
+        # Recent above, so the thing you just got wrong is the first row of
+        # both. Not (set, seq): seq restarts every set, so that would bury
+        # tonight's work under set 1. `recorded_at` is not shown; it only sorts.
+        display = store.newest_first(match_events, match_id)[schema.EVENT_COLUMNS].copy()
         editable = ["set_no", "seq", "player_num", "action", "action_result"]
         all_results = sorted({r for results in schema.ACTIONS.values() for r in results})
         edited = st.data_editor(
@@ -698,11 +830,17 @@ def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str)
             },
             key=f"editor::{match_id}",
         )
+        # Stashed for the callback, the way the squad and duplicate editors do
+        # it: a callback runs before the rerun, so it sees what was on screen
+        # when the button was pressed rather than a freshly rendered table.
+        st.session_state[f"editor_edit::{match_id}"] = edited
         col_save, col_download = st.columns(2)
-        if col_save.button("Save edits", key="save_edits", width="stretch"):
-            save_edits(edited, roster, match_id)
+        col_save.button("Save edits", key="save_edits", width="stretch",
+                        on_click=cb_save_edits, args=(match_id,))
         col_download.download_button(
             "Download this match (CSV)",
+            # Deliberately the other way round: a log you read elsewhere runs
+            # forwards through the match, set 1 first.
             match_events[schema.EVENT_COLUMNS].to_csv(index=False),
             file_name=f"{match_id}.csv",
             mime="text/csv",
@@ -710,8 +848,26 @@ def full_editor(match_events: pd.DataFrame, roster: pd.DataFrame, match_id: str)
         )
 
 
-def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> None:
-    """Re-validate every edited row, then write the whole match back to the buffer."""
+# What a row claims happened. Change any of it and a previous "yes, keep this"
+# was about a different row, so the review decision is withdrawn.
+CLAIM = ("set_no", "player_num", "action", "action_result")
+
+
+def cb_save_edits(match_id: str) -> None:
+    edited = st.session_state.get(f"editor_edit::{match_id}")
+    if edited is None or not len(edited):
+        return
+    save_edits(edited, match_id)
+
+
+def save_edits(edited: pd.DataFrame, match_id: str) -> None:
+    """Re-validate the edited rows and write back the ones that actually changed.
+
+    The name is resolved from the match line-up, never from the roster. The
+    roster is current; the line-up is the record of who wore which shirt on the
+    day. Looking a number up in the roster is how points scored by #4 in
+    September came back stamped with the name of whoever wears #4 now.
+    """
     problems = []
     rows = []
     for position, row in enumerate(edited.to_dict("records"), start=1):
@@ -720,9 +876,11 @@ def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> Non
         except schema.InvalidEvent as exc:
             problems.append(f"row {position}: {exc}")
             continue
-        player = store.find_by_number(roster, row["player_num"])
-        if player is not None:
-            row["player_name"] = player["name"]
+        # Resolve against the row's own set, which is itself editable. A number
+        # the line-up does not mention keeps the name it already carries rather
+        # than being blanked or guessed at.
+        names = store.names_for_set(match_id, int(row["set_no"]))
+        row["player_name"] = names.get(int(row["player_num"]), row["player_name"])
         row["action"], row["action_result"] = action, result
         row["is_point"] = schema.is_point(action, result)
         rows.append(row)
@@ -732,13 +890,29 @@ def save_edits(edited: pd.DataFrame, roster: pd.DataFrame, match_id: str) -> Non
         return
 
     events = store.load_events()
-    edited_ids = {row["event_id"] for row in rows}
-    updated = pd.DataFrame(rows)
-    updated["synced"] = False   # edited rows need re-pushing
-    events = store.concat_frames([events[~events["event_id"].isin(edited_ids)], updated])
+    before = events.set_index("event_id")
+    changed = []
+    for row in rows:
+        was = before.loc[row["event_id"]] if row["event_id"] in before.index else None
+        if was is None:
+            continue
+        fields = ["player_name", "is_point"] + list(CLAIM)
+        if all(str(was[field]) == str(row[field]) for field in fields):
+            continue   # untouched: leave its synced and reviewed flags alone
+        row["synced"] = False   # edited rows need re-pushing
+        if any(str(was[field]) != str(row[field]) for field in CLAIM):
+            row["reviewed"] = False
+        changed.append(row)
+
+    if not changed:
+        flash("success", "No changes to save.")
+        return
+
+    updated = pd.DataFrame(changed)
+    changed_ids = set(updated["event_id"])
+    events = store.concat_frames([events[~events["event_id"].isin(changed_ids)], updated])
     store.save_events(events)
-    flash("success", f"Saved {len(rows)} event(s)")
-    st.rerun()
+    flash("success", f"Saved {len(changed)} event(s)")
 
 
 # --- match setup ------------------------------------------------------------
@@ -767,13 +941,14 @@ def import_protocol(match: dict, pdf_bytes: bytes) -> None:
         team = config.team_name()
         summary = profixio.protocol_summary(protocol, team)
         events = profixio.protocol_to_events(
-            protocol, team, match["match_id"], store.load_roster()
+            protocol, team, match, store.load_roster()
         )
         if not events:
             flash("error", f"No {team} events found in that protocol - wrong match?")
             return
         store.replace_profixio_events(match["match_id"], events)
-        store.restamp_roles(match["match_id"])   # imported rows get roles too
+        store.restamp_players(match["match_id"])  # imported rows get the line-up's
+        store.restamp_roles(match["match_id"])    # names and roles
         flash("success",
               f"{summary['rows']} rows → {len(events)} events · "
               f"{summary['points_for']}-{summary['points_against']} points · "
@@ -848,11 +1023,14 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
         }
         for player in players
     ])
-    edited = st.data_editor(
+    rows = frame.to_dict("records")
+    st.data_editor(
         frame,
         key=key,
         hide_index=True,
         width="stretch",
+        on_change=cb_roles_changed,
+        args=(match_id, set_no, rows, key),
         column_config={
             "player_num": st.column_config.NumberColumn("#", disabled=True),
             "player_name": st.column_config.TextColumn("player", disabled=True),
@@ -861,70 +1039,249 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
             ),
         },
     )
-    if st.button("Save roles", key=f"{key}::save", width="stretch"):
-        by_number = {int(p["number"]): p for p in players}
-        rows = []
-        for record in edited.to_dict("records"):
-            player = by_number.get(int(record["player_num"]))
-            if player is None:
-                continue
-            rows.append({
-                "player_num": int(record["player_num"]),
-                "player_name": record["player_name"],
-                "player_role": str(record["player_role"] or ""),
-            })
-        store.set_lineup(match_id, set_no, rows)
-        # Events already recorded carry a role; push the change through so the
-        # two cannot quietly disagree.
-        store.restamp_roles(match_id, set_no)
-        flash("success", f"Roles saved for set {set_no}")
-        st.rerun()
+    st.caption("Changes save as you make them.")
 
 
 def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: dict) -> None:
-    """Most sets start the same as the one before, so carry it forward."""
-    if len(store.match_lineup(match_id, set_no)):
+    """Make sure the set has a line-up, and that everyone called up is in it.
+
+    Most sets start the same as the one before, so the previous set is carried
+    forward. It is then topped up with anyone in the squad who is missing -
+    otherwise a player who has not touched the ball yet would have no button.
+    """
+    set_no = int(set_no)
+    existing = store.match_lineup(match_id, set_no).to_dict("records")
+
+    if not existing:
+        for previous in range(set_no - 1, 0, -1):
+            if len(store.match_lineup(match_id, previous)):
+                store.copy_lineup(match_id, previous, set_no)
+                existing = store.match_lineup(match_id, set_no).to_dict("records")
+                break
+
+    rows = [
+        {k: row[k] for k in ("player_num", "player_name", "player_role")}
+        for row in existing
+    ]
+    present = {str(row["player_name"]) for row in rows}
+    taken = {int(row["player_num"]) for row in rows}
+
+    called = set(store.squad_numbers(match))
+    candidates = roster[roster["number"].isin(called)] if called else store.active_players(roster)
+    for player in candidates.sort_values("number").to_dict("records"):
+        # Skip on either key. A squad recorded in last season's numbering can
+        # otherwise collide with whoever wears that shirt now.
+        if player["name"] in present or int(player["number"]) in taken:
+            continue
+        present.add(player["name"])
+        taken.add(int(player["number"]))
+        rows.append({
+            "player_num": int(player["number"]),
+            "player_name": player["name"],
+            "player_role": player.get("position", "") or "",
+        })
+
+    if rows and len(rows) != len(existing):
+        store.set_lineup(match_id, set_no, sorted(rows, key=lambda r: int(r["player_num"])))
+    elif not existing and rows:
+        store.set_lineup(match_id, set_no, rows)
+
+
+def cb_apply_duplicates(match_id: str, set_no: int) -> None:
+    """Remove what was unticked, and remember everything that was kept.
+
+    Recording the decision is the point. Deleting used to be the only thing
+    that stuck, so a correction you chose to keep was offered for deletion
+    again on the next rerun, and again after that.
+    """
+    edited = st.session_state.get(f"dupes_edit::{match_id}::{set_no}")
+    if edited is None or not len(edited):
         return
-    for previous in range(int(set_no) - 1, 0, -1):
-        if len(store.match_lineup(match_id, previous)):
-            store.copy_lineup(match_id, previous, int(set_no))
-            return
-    squad = store.squad_players(roster, match)
-    if len(squad):
-        store.set_lineup(match_id, int(set_no), [
-            {
-                "player_num": int(player["number"]),
-                "player_name": player["name"],
-                "player_role": player.get("position", "") or "",
-            }
-            for player in squad.to_dict("records")
-        ])
+    keeping = edited["keep"].astype(bool)
+    dropping = edited[~keeping]["event_id"]
+    store.mark_reviewed(edited[keeping]["event_id"])
+    if not len(dropping):
+        flash("success", f"Set {set_no} reviewed - nothing unticked, nothing removed.")
+        return
+    store.drop_events(dropping)
+    flash("success",
+          f"Removed {len(dropping)} event(s) from set {set_no}; "
+          f"kept {int(keeping.sum())}.")
 
 
-def squad_section(roster: pd.DataFrame, match: dict) -> list:
-    st.markdown("**Called up**")
+def dupe_note(row) -> str:
+    """One sentence about a row, saying the same thing on every row of a group.
+
+    It used to read "the other source has 4" on your row and "the other source
+    has 6" on the protocol's, which are two true statements that look like a
+    contradiction. Both totals, stated the same way, is one fact you can act on.
+    """
+    if row["reviewed"]:
+        return "✓ kept on review"
+    if row["source"] == schema.SOURCE_MANUAL and not row["matches"]:
+        return "protocol has none - looks like a correction"
+    return f"protocol {int(row['n_protocol'])} · you {int(row['n_manual'])}"
+
+
+def review_duplicates(match: dict) -> None:
+    """Point-scoring events a set holds twice: once officially, once by hand.
+
+    Only these can be duplicates - the protocol records nothing else, so a
+    reception or a dig can never collide with it and is never shown here.
+    Nothing is removed until Apply, and every row is yours to tick.
+    """
+    match_id = match["match_id"]
+    st.markdown("**Review duplicates**")
+    if not store.has_profixio_events(match_id):
+        st.caption("No official protocol imported, so nothing can be a duplicate.")
+        return
+
+    set_no = st.selectbox("Set", [1, 2, 3, 4, 5], key=f"dupes_set::{match_id}")
+    candidates = store.duplicate_candidates(match_id, int(set_no))
+    if not len(candidates):
+        st.caption(f"Set {set_no} has no point-scoring events to compare.")
+        return
+
+    frame = pd.DataFrame([
+        {
+            "keep": bool(row["keep"]),
+            "source": "protocol" if row["source"] == schema.SOURCE_PROFIXIO else "you",
+            "player": f"#{int(row['player_num'])} {row['player_name']}",
+            "action": f"{row['action'].lower()} {row['action_result']}",
+            "score": (f"{int(row['score_us'])}-{int(row['score_them'])}"
+                      if row["source"] == schema.SOURCE_PROFIXIO else ""),
+            "note": dupe_note(row),
+            "event_id": row["event_id"],
+        }
+        for row in candidates.to_dict("records")
+    ])
+
+    edited = st.data_editor(
+        frame,
+        key=f"dupes::{match_id}::{set_no}",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "keep": st.column_config.CheckboxColumn("keep", width="small"),
+            "source": st.column_config.TextColumn("from", disabled=True),
+            "player": st.column_config.TextColumn("player", disabled=True),
+            "action": st.column_config.TextColumn("action", disabled=True),
+            "score": st.column_config.TextColumn("at", disabled=True),
+            "note": st.column_config.TextColumn("note", disabled=True),
+            "event_id": None,
+        },
+    )
+    st.session_state[f"dupes_edit::{match_id}::{set_no}"] = edited
+
+    dropping = int((~edited["keep"].astype(bool)).sum())
+    settled = int(candidates["reviewed"].astype(bool).sum())
+    already = f" {settled} already reviewed." if settled else ""
+    st.caption(
+        f"{len(edited)} point-scoring events in set {set_no}.{already} "
+        f"Apply would remove {dropping} and mark the rest reviewed, so they "
+        "stop coming back. Receptions, digs, attempts, errors and sets are "
+        "never shown here and are never touched."
+    )
+    unsettled = int((~candidates["reviewed"].astype(bool)).sum())
+    st.button(
+        f"Apply — remove {dropping}", key=f"dupes_apply::{match_id}::{set_no}",
+        on_click=cb_apply_duplicates, args=(match_id, int(set_no)),
+        width="stretch",
+        # Enabled with nothing to remove, because Apply is also how you say
+        # "these are all fine" and stop being asked.
+        disabled=dropping == 0 and unsettled == 0,
+    )
+
+
+def squad_editor(roster: pd.DataFrame, match: dict, set_no: int = 1) -> None:
+    """Who is playing, wearing what, in which role - one table.
+
+    Call-up, shirt number and role used to be two separate controls listing the
+    same people. They are one now, because they are one decision.
+    """
+    match_id = match["match_id"]
     if not len(roster):
         st.caption("No roster yet. Refresh from Profixio.")
-        return []
-    called = set(store.squad_numbers(match))
-    if not called:
-        called = set(int(n) for n in store.active_players(roster)["number"])
+        return
 
-    numbers, picked = [], []
-    players = roster.sort_values("number").to_dict("records")
-    columns = st.columns(2)
-    for index, player in enumerate(players):
-        number = int(player["number"])
-        numbers.append(number)
-        checked = columns[index % 2].checkbox(
-            f"#{number} {player['name']}",
-            value=number in called,
-            key=f"squad::{match['match_id']}::{number}",
-        )
-        if checked:
-            picked.append(number)
-    st.caption(f"{len(picked)} of {len(players)} selected")
-    return numbers
+    roles = store.roles_for_set(match_id, set_no)
+    lineup = store.match_lineup(match_id, set_no)
+    records = lineup.to_dict("records") if len(lineup) else []
+    # Matched by name, not number: a player who changed shirt between matches
+    # would otherwise silently drop out of a squad she is already in.
+    numbered = {str(r["player_name"]): int(r["player_num"]) for r in records}
+    named_roles = {str(r["player_name"]): r["player_role"] for r in records}
+    called_names = set(numbered)
+    called_numbers = set(store.squad_numbers(match))
+
+    # Where a line-up exists it is the authority on who played and what they
+    # wore; the roster only supplies anyone not in it yet. Otherwise a player
+    # whose shirt has since changed hands gets overwritten by whoever has it
+    # now, every time this screen is opened.
+    players = [
+        {"number": int(r["player_num"]), "name": r["player_name"],
+         "position": r["player_role"], "active": True}
+        for r in records
+    ]
+    present = {p["name"] for p in players}
+    players += [
+        p for p in roster.sort_values("number").to_dict("records")
+        if p["name"] not in present
+    ]
+    frame = pd.DataFrame([
+        {
+            "called": (player["name"] in called_names) if called_names
+                      else (int(player["number"]) in called_numbers) if called_numbers
+                      else bool(player["active"]),
+            "player_num": numbered.get(player["name"], int(player["number"])),
+            "player_name": player["name"],
+            "player_role": named_roles.get(
+                player["name"],
+                roles.get(int(player["number"]), player.get("position", "") or ""),
+            ),
+        }
+        for player in players
+    ])
+
+    edited = st.data_editor(
+        frame,
+        key=f"squad::{match_id}::{set_no}",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "called": st.column_config.CheckboxColumn("✓", width="small"),
+            "player_num": st.column_config.NumberColumn(
+                "#", min_value=0, max_value=99, step=1,
+                help="Shirt worn in this match - change it here if it differs",
+            ),
+            "player_name": st.column_config.TextColumn("player", disabled=True),
+            "player_role": st.column_config.SelectboxColumn(
+                "role", options=[""] + schema.ROLES, required=False
+            ),
+        },
+    )
+    picked = edited[edited["called"].astype(bool)]
+    st.caption(f"{len(picked)} of {len(edited)} called up")
+    st.session_state[f"squad_edit::{match_id}"] = edited
+
+
+def save_squad(match_id: str, set_no: int = 1) -> None:
+    """Persist the one table: squad numbers on the match, roles on the set."""
+    edited = st.session_state.get(f"squad_edit::{match_id}")
+    if edited is None or not len(edited):
+        return
+    picked = edited[edited["called"].astype(bool)]
+    store.set_squad(match_id, [int(n) for n in picked["player_num"]])
+    store.set_lineup(match_id, set_no, [
+        {
+            "player_num": int(row["player_num"]),
+            "player_name": row["player_name"],
+            "player_role": str(row["player_role"] or ""),
+        }
+        for row in picked.to_dict("records")
+    ])
+    store.restamp_players(match_id, set_no)
+    store.restamp_roles(match_id, set_no)
 
 
 def default_match_id(matches: pd.DataFrame) -> str:
@@ -983,16 +1340,12 @@ def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
                   on_click=cb_save_video_url, args=(match,), width="stretch")
         st.divider()
         protocol_section(match, match_events)
+        st.divider()
+        review_duplicates(match)
 
     with right:
-        numbers = squad_section(roster, match)
-        with st.expander("Starting roles (set 1)"):
-            called = set(store.squad_numbers(match)) or set(numbers)
-            players = [
-                p for p in roster.sort_values("number").to_dict("records")
-                if int(p["number"]) in called
-            ]
-            role_editor(chosen, 1, players, key=f"roles::setup::{chosen}")
+        st.markdown("**Called up**")
+        squad_editor(roster, match)
         st.divider()
         st.button("↻ Refresh from Profixio", key="sync_profixio",
                   on_click=cb_sync_profixio, width="stretch")
@@ -1003,7 +1356,7 @@ def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
             st.button("Create match", key="create_match",
                       on_click=cb_new_match, width="stretch")
         st.button("Start entering →", key="start_entering", type="primary",
-                  width="stretch", on_click=cb_start_entering, args=(chosen, numbers))
+                  width="stretch", on_click=cb_start_entering, args=(chosen,))
 
 
 def official_comparison(match: dict, team_row, match_events: pd.DataFrame) -> None:
@@ -1074,7 +1427,16 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
     the rerun, which matters because the video component is in here: fewer
     render passes, no chance of the player being disturbed by unrelated work.
     """
+    # A fragment keeps the arguments it was called with, so anything saved from
+    # inside it - the video URL, the squad, the roles - would still read back as
+    # it was at the last full rerun. Re-read the match row instead of trusting
+    # what was passed in.
     match_id = match["match_id"]
+    matches = store.load_matches()
+    current = matches[matches["match_id"] == match_id]
+    if len(current):
+        match = current.iloc[0].to_dict()
+
     set_no = int(st.session_state.set_no)
     show_video = st.session_state.show_video
     # Set here, not inside the panel: collapsing the video must not stop events
@@ -1116,7 +1478,7 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
         with st.expander(f"Roles · set {set_no}"):
             role_editor(
                 match_id, set_no,
-                store.squad_players(roster, match).to_dict("records"),
+                store.squad_players(roster, match, set_no).to_dict("records"),
                 key=f"roles::{match_id}::{set_no}",
             )
         st.divider()
@@ -1140,9 +1502,9 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
         box_score(match_events, matches, match)
 
     with right:
-        recent_events(match_events)
+        recent_events(store.newest_first(events, match_id, limit=12))
 
-    full_editor(match_events, roster, match_id)
+    full_editor(match_events, match_id)
 
 
 # --- page -------------------------------------------------------------------

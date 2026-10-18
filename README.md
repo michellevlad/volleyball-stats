@@ -40,13 +40,17 @@ python3 -m venv .venv                      # a private space for the app's code
 .venv/bin/python sync_profixio.py          # pull the season from Profixio
 ```
 
-From then on, the only command you need is:
+From then on, **double-click `Volleyball Stats` on the Desktop.** It starts the app if it is not
+already running and opens it in your browser. Launching it twice just reopens the tab.
+
+The equivalent from Terminal, if you prefer:
 
 ```bash
 .venv/bin/streamlit run app.py
 ```
 
-It opens in your browser at <http://localhost:8501>. Press `Ctrl-C` in Terminal to stop it.
+Either way it is at <http://localhost:8501>. To stop it: `Ctrl-C` in Terminal, or
+`pkill -f "streamlit run app.py"`. The launcher writes its output to `data/app.log`.
 
 ---
 
@@ -68,14 +72,26 @@ This is the screen you land on. Nothing can be entered until you have been throu
 
 ### 2. Watching the video
 
-The video sits across the top. Underneath it are the buttons: **tap the player, tap the action,
-tap the result.** Three taps and it is recorded.
+The video sits across the top. Underneath it are the buttons: **tap the action, tap the result,
+tap the player.** Three taps and it is recorded.
+
+The action row is first because it never changes — your hand goes to the same place every time.
+The player row comes last, by which point you already know the name. A **set assist** is the one
+exception: it asks a fourth time, for who it was set to.
+
+That fourth tap records **two** events — the setter's assist and the hitter's kill — because an
+assist is by definition a set that ended in a kill, and asking you to tap the same rally twice is
+how points get missed. If the official protocol already has that kill you now have it twice; that
+is deliberate, and **Review duplicates** is where you settle it, once.
+
+Click the video once, then YouTube's own shortcuts work:
 
 | key | what it does |
 |---|---|
-| `space` | play / pause |
-| `←` `→` | jump back / forward 5 seconds |
-| `shift` + `←` `→` | 1 second, for when it's close |
+| `k` or `space` | play / pause |
+| `j` `l` | jump back / forward 10 seconds |
+| `←` `→` | 5 seconds |
+| `,` `.` | one frame, when paused |
 
 There is nothing to type. The buttons are the only way in, so there is no shorthand to remember and
 nothing that can be mistyped.
@@ -145,7 +161,7 @@ is strong; below 2.0 means their serve is dictating the match.
 
 | Result | What happened | Effect |
 |---|---|---|
-| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Nothing directly |
+| **assist** | The set led directly to a kill. This is the standard stat — an assist only counts when the attack scores. | Records the hitter's kill too; a point for us |
 | **set (0)** | A set that didn't lead to a point. | Nothing |
 | **error** | A ball-handling fault (double contact, lift) or a set so bad it can't be played. | Point for them |
 
@@ -214,7 +230,14 @@ opponent error, **+1 them** for their points, and you can always type over the n
 ## Fixing mistakes
 
 - **✕** next to any recent event removes it.
-- **Edit all events** opens the whole match in a table you can edit like a spreadsheet.
+- **Edit all events** opens the whole match in a table you can edit like a spreadsheet, **newest
+  first** — the same order as Recent, so whatever you just got wrong is the top row of both. That
+  is the order you *registered* things in, not set-and-rally order: sets don't finish in the order
+  you track them, and the last thing you typed is the thing you want to reach.
+- **Names come from the line-up, never from the roster.** The roster is current; the line-up is who
+  wore which shirt *that day*. Shirt numbers get reassigned between matches, so a name looked up by
+  number in the roster puts tonight's #4 on the points scored by last month's #4. If a name is wrong
+  on an event, fix it in **Roles** for that set and every event of that set follows.
 - **Official vs entered** under the box score checks **each set separately** against Profixio, so
   you can confirm a set the moment you finish it rather than discovering at the end of the match
   that one went in under the wrong number:
@@ -227,6 +250,23 @@ opponent error, **+1 them** for their points, and you can always type over the n
   | Result | 3-0 | 2-0 | ⚠️ |
 - Re-importing the protocol is always safe: it replaces only the imported rows and never touches
   anything you entered from the video.
+
+### Review duplicates
+
+The protocol owns the points. If you also tapped an ace the scoresheet already had, the set now
+holds it twice and the player looks twice as productive. **Review duplicates** lists the
+point-scoring events of one set — aces, kills and block points, the only three a protocol records —
+with both sources side by side. Receptions, digs, attempts, errors and sets can never collide with
+a protocol, so they are never shown and never touched.
+
+Each row says what both sides hold: `protocol 4 · you 2`. The guess is that a row the protocol also
+has is a re-entry, and a row it has nothing like is a correction — because **the scoresheet is
+sometimes wrong**, and "she had 10 aces, not 7" has to be recordable.
+
+**Apply is how you record a decision, not just how you delete.** It removes what you unticked and
+marks everything you kept as reviewed, so it is never questioned again — a kept row comes back
+marked `✓ kept on review`. Press Apply even when there is nothing to remove; that is how you say
+"these are all fine" and stop being asked. Add new events later and only *those* are asked about.
 
 ---
 
@@ -300,6 +340,9 @@ With that set, **⬇ Restore from Sheets** in the sidebar pulls the archived eve
 additive — events already on this machine are left exactly as they are, so restoring can never
 overwrite work in progress, and restoring twice changes nothing.
 
+Corrections flow the other way on a push: fix a name or delete an event here, and the next push
+makes the sheet match for that match. So the two never drift.
+
 Available names: `PlayerSetStats`, `Events`, `Matches`, `Lineup`, `PlayerMatchStats`,
 `TeamMatchStats`, `PlayerRoleStats`. `Events`, `Matches` and `Lineup` append and deduplicate;
 the rest are rebuilt each push.
@@ -312,8 +355,12 @@ but none of the attempts, errors, receptions or digs you watched for.
 
 When a push writes into a tab that already has its own columns, it fits in around them:
 
-- **Rows are added, never rewritten.**
-- **Columns are matched by name**; unrecognised ones are left blank in new rows.
+- **A match this machine holds is mirrored.** Corrections reach rows written weeks ago, and events
+  you delete stop coming back — without that, Restore would resurrect everything Review duplicates
+  had just removed.
+- **A match this machine has never seen is left exactly as it is.** That is what makes the archive
+  worth keeping after a local loss.
+- **Columns are matched by name**; ones the app doesn't recognise are carried across untouched.
 - **Columns it needs but can't find are added on the far right.** Nothing is reordered.
 
 Use **Tab mapping** in the sidebar to say which of your tabs holds what.
@@ -322,21 +369,71 @@ Use **Tab mapping** in the sidebar to say which of your tabs holds what.
 
 ## The dashboard
 
-In [Looker Studio](https://lookerstudio.google.com): **Create → Data source → Google Sheets**, and
-pick `PlayerSetStats`. One source is enough — every other view is a different grouping of it. Set `match_date` as the date dimension and check that the percentages arrive as **Number** and not
-Text.
+In [Looker Studio](https://lookerstudio.google.com): **Create → Data source → Google Sheets**. Two
+sources cover everything — `PlayerSetStats` for anything about players, `Matches` for the fixture
+list.
 
-Four charts worth building:
+Set `match_date` (and `date` on Matches) as the date dimension, and check the counts arrive as
+**Number**, not Text.
 
-All from the one source, just grouped differently:
+### Calculated fields
 
-- **Season leaderboard** — group by `player_name`.
-- **Role comparison** — group by `player_name` and `player_role`: her numbers as OH versus as MB.
-- **Match box score** — group by `player_name`, filtered to one `match_name`.
-- **Set detail** — group by `set_no`, the shape a per-set spreadsheet already has.
-- **Form over time** — `match_date` on the x-axis with hitting efficiency.
+Every rate lives here, not in the sheet — a stored rate cannot be re-aggregated, so these stay
+correct whether the chart shows one set, one match or the whole season.
 
-Looker caches — press **Refresh data** after a push if the numbers look old.
+| Field | Formula |
+|---|---|
+| Points | `SUM(kills) + SUM(aces) + SUM(blocks)` |
+| Games | `COUNT_DISTINCT(match_id)` |
+| Points per match | `(SUM(kills) + SUM(aces) + SUM(blocks)) / COUNT_DISTINCT(match_id)` |
+| Kill % | `SUM(kills) / SUM(attempts)` |
+| Hitting efficiency | `(SUM(kills) - SUM(attack_errors)) / SUM(attempts)` |
+| Pass rating | `(3 * SUM(receptions_perfect) + 2 * SUM(receptions_playable)) / SUM(reception_count)` |
+| Serve error % | `SUM(serve_errors) / SUM(serves)` |
+
+Write them as `SUM(x) / SUM(y)`, never as an average of a rate. Guard a divide-by-zero with
+`NARY_MAX(SUM(attempts), 1)` where a filter could leave a player with none.
+
+### Scorers board
+
+The Profixio top-scorers table, from `PlayerSetStats`:
+
+| | |
+|---|---|
+| **Dimension** | `player_name` |
+| **Metrics** | Points · Points per match · `SUM(kills)` *(their "Anfall")* · `SUM(blocks)` *(Block)* · `SUM(aces)` *(Serveess)* · Games |
+| **Sort** | Points, descending |
+
+Swap the dimension for `player_role` to get the same board by position, or add it as a second
+dimension to see a player split by the roles she played.
+
+> **This covers our players only.** Profixio's board spans the division; ours is built from the
+> protocols you import, and those name almost no opponents — their points come overwhelmingly from
+> *our* errors, which belong to no player. A board including other teams would be wrong rather than
+> incomplete.
+
+### Match list
+
+The fixture view, from `Matches`:
+
+| | |
+|---|---|
+| **Dimensions** | `date` · `time` · `home_team` · `away_team` · `sets_home` · `result_home` |
+| **Sort** | `date` |
+| **Filter** | `result_home` *is not null* for played matches only |
+
+`sets_home` and `result_home` are printed **home side first**, the way the league does
+(`9-25, 5-25, 6-25` and `0-3`). `official_sets` and `official_result` are the same match from our
+point of view (`25-9, 25-5, 25-6` and `3-0`) — use those for anything about how *we* did.
+
+### Worth building too
+
+- **Role comparison** — `PlayerSetStats`, dimensions `player_name` + `player_role`: her numbers as
+  OH versus as MB.
+- **Match box score** — dimension `player_name`, filtered to one `match_name`.
+- **Form over time** — `match_date` across the x-axis against hitting efficiency.
+
+Looker caches; press **Refresh data** after a push if the numbers look old.
 
 ---
 
@@ -365,8 +462,9 @@ loses nothing. Google Sheets is only involved when you press push.
 
 **Why the video panel is a custom component:** Streamlit re-runs the whole page on every click. A
 normal embedded video would restart each time you recorded a kill. A custom component keeps its
-frame alive across re-runs, and it is also the only way to read the player's clock — which is what
-lets every event know where it is in the video.
+frame alive across re-runs. Inside it is a plain YouTube embed — the IFrame API was only there to
+read the player clock, and once that was no longer needed it was pure risk: if its script failed to
+re-initialise after a rebuild, the panel stayed blank.
 
 ```bash
 .venv/bin/python -m pytest -q      # 228 tests

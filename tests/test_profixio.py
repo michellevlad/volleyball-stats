@@ -6,6 +6,7 @@ what it might look like.
 """
 
 import gzip
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -19,11 +20,21 @@ TEAM = "Elden VBK"
 # The recordings are a real season page and a real match protocol, so they name
 # actual people - teammates, the opposition and the referees. They are kept out
 # of version control; see tests/fixtures/README.md for how to make your own.
+#
+# The handful of names this file has to assert on live beside them in
+# names.json, and are git-ignored for the same reason. Only the tests that
+# check the parser against the real recording need them; everywhere else the
+# data is invented, because what is being tested is the logic, not the people.
 pytestmark = pytest.mark.skipif(
     not (FIXTURES / "profixio_team.html.gz").exists()
-    or not (FIXTURES / "a_32681384.pdf").exists(),
+    or not (FIXTURES / "a_32681384.pdf").exists()
+    or not (FIXTURES / "names.json").exists(),
     reason="Profixio recordings are not in version control (they contain real names)",
 )
+
+
+def real_names() -> dict:
+    return json.loads((FIXTURES / "names.json").read_text())
 
 # The Jomala match, verified by hand against the PDF.
 JOMALA = {
@@ -107,9 +118,10 @@ def test_parses_the_squad(season_html):
     assert numbers == sorted(numbers)
     assert numbers == [1, 4, 6, 7, 8, 9, 10, 11, 15, 18, 99]
     by_number = {p["number"]: p["name"] for p in roster}
-    assert by_number[1] == "Michelle Rebeca Vlad"
-    assert by_number[99] == "Milena Jeczalik"
-    assert by_number[15] == "Isadora Labaki Gonçalo"   # non-ASCII survives
+    expected = real_names()["squad"]
+    for number, name in expected.items():
+        assert by_number[int(number)] == name
+    assert any(not name.isascii() for name in expected.values())   # and survives
 
 
 # --- the protocol -----------------------------------------------------------
@@ -213,18 +225,22 @@ def test_imported_events_are_tagged_as_imported(events):
     assert all(e["match_date"] == "2026-09-26" for e in events)
 
 
-def test_the_roster_name_wins_over_the_protocol_spelling(protocol):
+def test_the_protocol_name_wins_over_whoever_wears_that_shirt_now(protocol):
+    """One player wore #4 that day; someone else wears it now.
+
+    The points belong to whoever the protocol names, not to the current holder
+    of the shirt.
+    """
+    names = real_names()
     roster = pd.DataFrame(
-        [{"player_id": "p99", "number": 99, "name": "Milena J", "position": "OH",
-          "active": True}],
+        [{"player_id": "p4", "number": 4, "name": names["shirt_4_now"],
+          "position": "S", "active": True}],
         columns=schema.ROSTER_COLUMNS,
     )
     events = profixio.protocol_to_events(protocol, TEAM, MATCH, roster)
-    milena = next(e for e in events if e["player_num"] == 99)
-    assert milena["player_name"] == "Milena J"
-    # Anyone not on the roster keeps the name the protocol gave them.
-    other = next(e for e in events if e["player_num"] != 99)
-    assert other["player_name"]
+    four = next(e for e in events if e["player_num"] == 4)
+    assert four["player_name"] == names["shirt_4_then"]
+    assert all(event["player_name"] for event in events)
 
 
 def test_the_box_score_matches_the_official_sets(events):
@@ -244,7 +260,7 @@ def test_a_protocol_for_another_team_yields_nothing(protocol):
 def test_reimport_replaces_only_imported_events(temp_store, events):
     manual = store.build_event(
         match=MATCH, set_no=1, seq=1,
-        player={"player_id": "p7", "number": 7, "name": "Canan"},
+        player={"player_id": "p7", "number": 7, "name": "Rosa"},
         action=schema.RECEPTION, result="perfect",
     )
     store.append_event(manual)
@@ -262,7 +278,7 @@ def test_reimport_replaces_only_imported_events(temp_store, events):
 def test_import_does_not_touch_other_matches(temp_store, events):
     other = store.build_event(
         match={**MATCH, "match_id": "m2"}, set_no=1, seq=1,
-        player={"player_id": "p7", "number": 7, "name": "Canan"},
+        player={"player_id": "p7", "number": 7, "name": "Rosa"},
         action=schema.DIG, result="dig",
     )
     store.append_event(other)
@@ -312,12 +328,57 @@ def test_merging_the_roster_preserves_position_and_active(temp_store, season_htm
     assert len(again) == 11
 
 
-def test_players_dropped_from_profixio_are_kept(temp_store, season_html):
+def test_players_dropped_from_profixio_are_kept_but_deactivated(temp_store, season_html):
     """Deleting them would orphan every event they appear in."""
     players = profixio.parse_roster(season_html)
     store.merge_profixio_roster(players)
     store.merge_profixio_roster(players[:3])
-    assert len(store.load_roster()) == 11
+
+    roster = store.load_roster()
+    assert len(roster) == 11
+    assert roster["active"].sum() == 3
+    # ...and they stay out of the default call-up.
+    assert len(store.active_players(roster)) == 3
+
+
+def test_a_changed_shirt_number_updates_the_player(temp_store):
+    """Numbers move between matches; the player is the same person."""
+    store.merge_profixio_roster([{"number": 99, "name": "Rosa Hartley"}])
+    store.save_roster(store.load_roster().assign(position="MB"))
+
+    store.merge_profixio_roster([{"number": 31, "name": "Rosa Hartley"}])
+    roster = store.load_roster()
+    assert len(roster) == 1
+    assert int(roster.iloc[0]["number"]) == 31
+    assert roster.iloc[0]["position"] == "MB"      # local edits survive
+
+
+def test_a_number_handed_to_someone_else_does_not_rename_anyone(temp_store):
+    """One player moved 4 -> 17 and another took 4. Two people, not a rename.
+
+    This really happened, and keying the merge on shirt number silently turned
+    one teammate into another.
+    """
+    store.merge_profixio_roster([{"number": 4, "name": "Nadia Karim"}])
+    store.merge_profixio_roster([
+        {"number": 17, "name": "Nadia Karim"},
+        {"number": 4, "name": "Elin Sund"},
+    ])
+    roster = store.load_roster()
+    by_name = {r["name"]: int(r["number"]) for r in roster.to_dict("records")}
+    assert by_name == {"Nadia Karim": 17, "Elin Sund": 4}
+    assert len(roster) == 2
+
+
+def test_a_sync_never_overrides_your_own_active_flag(temp_store):
+    """Someone can be in the registered squad and still be injured."""
+    store.merge_profixio_roster([{"number": 18, "name": "Vera Koslow"}])
+    roster = store.load_roster()
+    roster["active"] = False
+    store.save_roster(roster)
+
+    store.merge_profixio_roster([{"number": 18, "name": "Vera Koslow"}])
+    assert bool(store.load_roster().iloc[0]["active"]) is False
 
 
 # --- the protocol download is behind a bot check ----------------------------
@@ -365,3 +426,44 @@ def test_the_sync_cli_passes_a_match_row_not_an_id(temp_store, protocol, monkeyp
     assert len(saved) == 52
     assert set(saved["match_name"]) == {"Jomala IK C vs Elden VBK"}
     assert set(saved["match_date"]) == {"2026-09-26"}
+
+
+# --- the match sheet --------------------------------------------------------
+
+def test_fixtures_carry_both_teams_and_the_time(season_html):
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+    jomala = next(f for f in fixtures if f["profixio_match_id"] == "32681384")
+    assert jomala["time"] == "14:30"
+    assert jomala["home"] == "Jomala IK C"
+    assert jomala["away"] == TEAM
+
+
+def test_the_score_is_recorded_both_ways_round(season_html):
+    """Home-first for the match sheet, ours-first for everything else."""
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+
+    away = next(f for f in fixtures if f["profixio_match_id"] == "32681384")
+    assert away["home_away"] == "away"
+    assert (away["result_home"], away["sets_home"]) == ("0-3", "9-25, 5-25, 6-25")
+    assert (away["official_result"], away["official_sets"]) == ("3-0", "25-9, 25-5, 25-6")
+
+
+def test_unplayed_fixtures_have_no_scores_either_way(season_html):
+    for fixture in profixio.parse_fixtures(season_html, TEAM):
+        if not fixture["played"]:
+            assert fixture["result_home"] == "" and fixture["sets_home"] == ""
+
+
+def test_the_match_sheet_survives_a_resync(temp_store, season_html):
+    fixtures = profixio.parse_fixtures(season_html, TEAM)
+    store.merge_profixio_fixtures(fixtures)
+    matches = store.load_matches()
+    played = matches[matches["result_home"].astype(str) != ""]
+    assert len(played) == 2
+    row = played[played["opponent"] == "Jomala IK C"].iloc[0]
+    assert (row["time"], row["home_team"], row["away_team"]) == (
+        "14:30", "Jomala IK C", "Elden VBK"
+    )
+
+    store.merge_profixio_fixtures(fixtures)
+    assert len(store.load_matches()) == 16

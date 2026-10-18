@@ -174,3 +174,143 @@ def test_every_event_carries_the_match_details():
     event = make_event()
     assert event["match_date"] == "2026-09-26"
     assert event["match_name"] == "Elden VBK vs Lions"
+
+
+def test_two_players_cannot_share_a_shirt_in_one_set():
+    """A squad recorded in old numbering can collide with the current roster."""
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Nadia", "player_role": "OH"},
+        {"player_num": 4, "player_name": "Elin", "player_role": "S"},
+    ])
+    squad = store.squad_players(pd.DataFrame(columns=schema.ROSTER_COLUMNS),
+                                {"match_id": "m1"}, 1)
+    assert list(squad["number"]) == [4]
+    assert list(squad["name"]) == ["Nadia"]
+
+
+def test_correcting_the_lineup_fixes_names_on_events_already_recorded():
+    """A shirt that changed hands between seasons must not rewrite history."""
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Elin", "player_role": "S"},
+    ])
+    store.append_event(make_event(set_no=1, seq=1))
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=2,
+        player={"player_id": "p4", "number": 4, "name": "Elin"},
+        action=schema.ATTACK, result="kill",
+    ))
+    assert "Elin" in set(store.load_events()["player_name"])
+
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"},
+    ])
+    store.restamp_players("m1", 1)
+
+    events = store.load_events()
+    four = events[events["player_num"] == 4]
+    assert set(four["player_name"]) == {"Nadia"}
+    # Everyone else is left alone.
+    assert set(events[events["player_num"] == 7]["player_name"]) == {"Ana"}
+
+
+def test_restamping_leaves_a_number_the_lineup_does_not_mention():
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"},
+    ])
+    store.append_event(make_event(set_no=1, seq=1))      # #7 Ana, not in the line-up
+    store.restamp_players("m1", 1)
+    assert set(store.load_events()["player_name"]) == {"Ana"}
+
+
+# --- ordering by when it was registered -------------------------------------
+
+MATCH_A = {"match_id": "m1", "date": "2026-09-26", "opponent": "Jomala",
+           "home_away": "away"}
+
+
+def _event(set_no, seq, result, **extra):
+    return store.build_event(
+        match=MATCH_A, set_no=set_no, seq=seq,
+        player={"number": 7, "name": "Ana"},
+        action=schema.SERVE, result=result, **extra,
+    )
+
+
+def test_a_new_event_carries_a_registration_stamp(temp_store):
+    store.append_event(_event(1, 1, "ace"))
+    assert store.load_events().iloc[0]["recorded_at"]
+
+
+def test_newest_first_follows_the_stamp_not_the_file_order(temp_store):
+    """seq restarts each set, so (set, seq) is not the order you worked in."""
+    store.append_event(_event(1, 1, "ace", recorded_at="2026-10-18T19:00:00"))
+    store.append_event(_event(1, 2, "in", recorded_at="2026-10-18T19:01:00"))
+    # Set 2, entered later, but with a lower seq than set 1 reached.
+    store.append_event(_event(2, 1, "error", recorded_at="2026-10-18T19:30:00"))
+
+    order = list(store.newest_first(store.load_events(), "m1")["action_result"])
+    assert order == ["error", "in", "ace"]
+
+
+def test_newest_first_survives_the_file_being_rewritten(temp_store):
+    """Row order is not a stand-in: saving edits re-appends what it touched."""
+    store.append_event(_event(1, 1, "ace", recorded_at="2026-10-18T19:00:00"))
+    store.append_event(_event(1, 2, "in", recorded_at="2026-10-18T19:01:00"))
+
+    # Move the oldest row to the end of the file, as a rewrite would.
+    events = store.load_events()
+    store.save_events(store.concat_frames([events.iloc[1:], events.iloc[:1]]))
+
+    assert store.newest_first(store.load_events(), "m1").iloc[0]["action_result"] == "in"
+
+
+def test_one_import_shares_one_instant_and_orders_by_seq(temp_store):
+    for seq in (1, 2, 3):
+        store.append_event(_event(
+            1, seq, "ace", source=schema.SOURCE_PROFIXIO,
+            recorded_at="2026-10-18T18:00:00",
+        ))
+    order = list(store.newest_first(store.load_events(), "m1")["seq"])
+    assert order == [3, 2, 1]
+
+
+def test_backfill_orders_the_protocol_before_the_hand_entry(temp_store):
+    rows = [
+        _event(2, 1, "in"),                                    # entered later
+        _event(1, 1, "ace"),                                   # entered first
+        _event(1, 1, "error", source=schema.SOURCE_PROFIXIO),  # imported first
+    ]
+    for row in rows:
+        row["recorded_at"] = ""
+        store.append_event(row)
+
+    assert store.backfill_recorded_at() == 3
+    order = list(store.newest_first(store.load_events(), "m1")["action_result"])
+    assert order == ["in", "ace", "error"]
+
+
+def test_backfill_leaves_stamped_rows_alone_and_is_repeatable(temp_store):
+    store.append_event(_event(1, 1, "ace", recorded_at="2020-01-01T00:00:00"))
+    blank = _event(1, 2, "in")
+    blank["recorded_at"] = ""
+    store.append_event(blank)
+
+    assert store.backfill_recorded_at() == 1
+    assert store.backfill_recorded_at() == 0      # nothing left to do
+    stamps = dict(zip(store.load_events()["action_result"],
+                      store.load_events()["recorded_at"]))
+    assert stamps["ace"] == "2020-01-01T00:00:00"
+
+
+def test_mark_reviewed_sticks(temp_store):
+    store.append_event(_event(1, 1, "ace"))
+    assert bool(store.load_events().iloc[0]["reviewed"]) is False
+    store.mark_reviewed(store.load_events()["event_id"])
+    assert bool(store.load_events().iloc[0]["reviewed"]) is True
+
+
+def test_names_for_set_reads_the_lineup(temp_store):
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Nadia", "player_role": "S"}])
+    assert store.names_for_set("m1", 1) == {4: "Nadia"}
+    assert store.names_for_set("m1", 2) == {}

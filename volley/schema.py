@@ -42,17 +42,15 @@ ACTIONS = {
 # playable ball is still far better than a shank.
 RECEPTION_VALUES = {"perfect": 3, "playable": 2, "error": 0}
 
-ACTION_ORDER = [ATTACK, SERVE, RECEPTION, DIG, BLOCK, SET]
+ACTION_ORDER = [SERVE, ATTACK, RECEPTION, DIG, BLOCK, SET]
 
 # Short labels for the result buttons, so the grid stays readable.
+# Plain words only. A parenthetical number would suggest a single scale, and a
+# "0" means something different for an attack than for a reception.
 RESULT_LABELS = {
-    (RECEPTION, "perfect"): "perfect",
-    (RECEPTION, "playable"): "playable",
-    (RECEPTION, "error"): "error",
-    (ATTACK, "attempt"): "attempt (0)",
     (BLOCK, "kill"): "block point",
-    (BLOCK, "attempt"): "touch (0)",
-    (SET, "attempt"): "set (0)",
+    (BLOCK, "attempt"): "touch",
+    (SET, "attempt"): "set",
 }
 
 # Results that end the rally in our favour and so bump our score by one.
@@ -127,7 +125,14 @@ ROSTER_COLUMNS = ["player_id", "number", "name", "position", "active"]
 MATCH_COLUMNS = [
     "match_id",
     "date",
+    "time",
     "opponent",
+    # Both sides by name, and the score the way the league prints it: home
+    # first. `official_result`/`official_sets` stay from our point of view.
+    "home_team",
+    "away_team",
+    "result_home",
+    "sets_home",
     "home_away",
     "competition",
     "sets_won",
@@ -155,6 +160,8 @@ EVENT_COLUMNS = [
     "action",
     "action_result",
     "is_point",
+    # Who an assist was set to. Blank on everything else.
+    "target_num",
     "source",
     "event_id",
     "seq",
@@ -167,8 +174,17 @@ EVENT_COLUMNS = [
 SOURCE_MANUAL = "manual"
 SOURCE_PROFIXIO = "profixio"
 
-# Local-only bookkeeping column, never written to the spreadsheet.
-LOCAL_ONLY_COLUMNS = ["synced"]
+# Local-only bookkeeping, never written to the spreadsheet.
+#
+# `recorded_at` is when the row was entered here, not anything about the match.
+# It exists because `seq` restarts at 1 in every set and so cannot order a
+# match, and because the buffer is rewritten often enough that row order is not
+# a reliable stand-in. It decides what "newest" means and is never displayed.
+#
+# `reviewed` is "I have looked at this in Review duplicates and decided".
+# Without it the panel recomputes its guess every rerun and keeps offering to
+# delete the corrections you deliberately kept.
+LOCAL_ONLY_COLUMNS = ["synced", "recorded_at", "reviewed"]
 
 # Keyed by shirt number: it is unique within a match, and it is what you see
 # on the court.

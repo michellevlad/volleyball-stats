@@ -23,9 +23,10 @@ DEFAULTS = {
     "VOLLEY_TEAM_NAME": "Elden VBK",
     "VOLLEY_CLUB_NAME": "Elden VBK",
     "VOLLEY_LOGO": str(ROOT / "assets" / "elden-vbk.png"),
-    # Which tabs a push writes. The dashboard only needs the per-set table;
-    # add "Events" here to keep an off-machine copy of the raw rows as well.
-    "VOLLEY_PUSH_TABS": "PlayerSetStats",
+    # Which tabs a push writes. PlayerSetStats drives the dashboard; Events is
+    # the append-only archive of the raw rows, and the only thing that makes a
+    # lost local buffer recoverable - an aggregate cannot be taken apart again.
+    "VOLLEY_PUSH_TABS": "PlayerSetStats,Events,Matches",
     # A service-account key, if you have one. Share the spreadsheet with the
     # account's email and it works like any other collaborator.
     "VOLLEY_SERVICE_ACCOUNT": str(ROOT / "service_account.json"),

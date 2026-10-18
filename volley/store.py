@@ -12,7 +12,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -32,7 +32,7 @@ INT_COLUMNS = {
     "set_no", "seq", "number", "player_num", "score_us", "score_them",
     "sets_won", "sets_lost",
 }
-BOOL_COLUMNS = {"is_point", "synced", "active"}
+BOOL_COLUMNS = {"is_point", "synced", "active", "reviewed"}
 
 _TRUE = {"true", "1", "yes", "y", "t"}
 
@@ -97,6 +97,11 @@ def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def now_stamp() -> str:
+    """UTC, to the second, sortable as a plain string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def new_match_id(date: str, opponent: str) -> str:
     return f"{date}-{slugify(opponent)}"
 
@@ -126,8 +131,10 @@ def build_event(
     score_us: int = 0,
     score_them: int = 0,
     role: str = "",
+    target_num=None,
     source: str = schema.SOURCE_MANUAL,
     event_id: str = "",
+    recorded_at: str = "",
 ) -> dict:
     """Assemble one validated event row. Raises schema.InvalidEvent on bad input.
 
@@ -147,12 +154,15 @@ def build_event(
         "action": action,
         "action_result": result,
         "is_point": schema.is_point(action, result),
+        "target_num": "" if target_num in (None, "") else int(target_num),
         "source": source,
         "event_id": event_id or new_id(),
         "seq": int(seq),
         "score_us": int(score_us),
         "score_them": int(score_them),
         "synced": False,
+        "recorded_at": recorded_at or now_stamp(),
+        "reviewed": False,
     }
 
 
@@ -187,12 +197,45 @@ def mark_synced(event_ids) -> pd.DataFrame:
     return events
 
 
+def mark_reviewed(event_ids) -> pd.DataFrame:
+    """Record that these rows have been through Review duplicates.
+
+    A kept row has to say so, or the panel recomputes its guess on the next
+    rerun and offers to delete the correction you just chose to keep.
+    """
+    events = load_events()
+    events.loc[events["event_id"].isin(list(event_ids)), "reviewed"] = True
+    save_events(events)
+    return events
+
+
 def unsynced(events: pd.DataFrame) -> pd.DataFrame:
     return events[~events["synced"].astype(bool)]
 
 
 def match_events(events: pd.DataFrame, match_id: str) -> pd.DataFrame:
     return events[events["match_id"] == match_id].sort_values(["set_no", "seq"])
+
+
+def newest_first(events: pd.DataFrame, match_id: str, limit: int = None) -> pd.DataFrame:
+    """Most recently registered first - what you just did, at the top.
+
+    Ordered by `recorded_at`, not by row order and not by (set, seq). Row order
+    looks right until something rewrites the file: saving edits re-appends the
+    rows it touched, a protocol import appends the whole import at the end, and
+    a restore appends what it brings back. Any of those would hoist old rows to
+    the top. And (set, seq) is not registration order either, because seq
+    restarts at 1 in each set - after working set 1 then set 2, set 1's events
+    still sort last.
+
+    `seq` breaks ties, which is what orders a protocol import: every imported
+    row shares the one instant it arrived.
+    """
+    rows = events[events["match_id"] == match_id]
+    rows = rows.sort_values(
+        ["recorded_at", "seq"], ascending=False, kind="stable"
+    )
+    return rows.head(limit) if limit else rows
 
 
 def current_score(events: pd.DataFrame, match_id: str, set_no: int) -> tuple[int, int]:
@@ -225,6 +268,12 @@ def active_players(roster: pd.DataFrame) -> pd.DataFrame:
 
 
 def find_by_number(roster: pd.DataFrame, number: int) -> dict | None:
+    """Look a roster player up by shirt number.
+
+    Not for naming a recorded event: the roster is current, and a number that
+    changed hands between matches then stamps the wrong player onto what the
+    old one did. Use `names_for_set`, which asks the match's own line-up.
+    """
     rows = roster[roster["number"] == int(number)]
     return rows.iloc[0].to_dict() if len(rows) else None
 
@@ -274,8 +323,30 @@ def squad_numbers(match: dict) -> list[int]:
     return [int(part) for part in re.findall(r"\d+", raw)]
 
 
-def squad_players(roster: pd.DataFrame, match: dict) -> pd.DataFrame:
-    """The roster narrowed to the called-up squad, in shirt-number order."""
+def squad_players(roster: pd.DataFrame, match: dict, set_no: int = 1) -> pd.DataFrame:
+    """Who is on court, wearing the number they wear *in this match*.
+
+    The line-up wins when there is one, because a shirt number belongs to a
+    match rather than to a season - Profixio reassigns them, and a player can
+    borrow a shirt for one game. The roster is only the fallback.
+    """
+    lineup = match_lineup(match.get("match_id", ""), set_no)
+    if len(lineup):
+        # One shirt, one player - a duplicate number would collide in the UI.
+        lineup = lineup.drop_duplicates("player_num", keep="first")
+        return pd.DataFrame(
+            [
+                {
+                    "player_id": f"p{int(row['player_num'])}",
+                    "number": int(row["player_num"]),
+                    "name": row["player_name"],
+                    "position": row["player_role"],
+                    "active": True,
+                }
+                for row in lineup.sort_values("player_num").to_dict("records")
+            ],
+            columns=schema.ROSTER_COLUMNS,
+        )
     called = squad_numbers(match)
     if not called:
         return active_players(roster)
@@ -296,21 +367,43 @@ def set_squad(match_id: str, numbers) -> pd.DataFrame:
 # event - survives a re-sync untouched.
 
 def merge_profixio_roster(players: list) -> pd.DataFrame:
+    """Refresh the roster from Profixio, matching players by *name*.
+
+    Shirt numbers change between matches, so keying on the number is wrong in
+    two ways at once: a player who switches number gets added a second time,
+    and whoever inherits her old number silently takes over her row. Names are
+    the stable thing.
+
+    Players no longer in the Profixio squad are kept but deactivated - their
+    recorded events still refer to them, and events store the number and name
+    as they were at the time, so history is unaffected either way. For everyone
+    still in the squad the `active` flag is left exactly as you set it.
+    """
     roster = load_roster()
-    existing = {int(row["number"]): row for row in roster.to_dict("records")}
-    merged = []
+    existing = {}
+    for row in roster.to_dict("records"):
+        existing.setdefault(str(row["name"]).strip(), row)
+
+    merged, seen = [], set()
     for player in players:
+        name = str(player["name"]).strip()
         number = int(player["number"])
-        current = existing.pop(number, None)
+        current = existing.get(name)
+        seen.add(name)
         if current is None:
             merged.append({
-                "player_id": f"p{number}", "number": number, "name": player["name"],
+                "player_id": f"p{number}", "number": number, "name": name,
                 "position": "", "active": True,
             })
         else:
-            merged.append({**current, "name": player["name"]})
-    # Players no longer listed are kept, not deleted - their events still exist.
-    merged.extend(existing.values())
+            # `active` is yours - someone can be in the registered squad and
+            # still be injured. A sync only ever changes the number.
+            merged.append({**current, "number": number, "name": name})
+
+    for name, row in existing.items():
+        if name not in seen:
+            merged.append({**row, "active": False})
+
     save_roster(pd.DataFrame(merged, columns=schema.ROSTER_COLUMNS))
     return load_roster()
 
@@ -344,7 +437,12 @@ def merge_profixio_fixtures(fixtures: list) -> pd.DataFrame:
             **(current or {}),
             "match_id": match_id,
             "date": fixture["date"],
+            "time": fixture.get("time", ""),
             "opponent": fixture["opponent"],
+            "home_team": fixture.get("home", ""),
+            "away_team": fixture.get("away", ""),
+            "result_home": fixture.get("result_home", ""),
+            "sets_home": fixture.get("sets_home", ""),
             "home_away": fixture["home_away"],
             "profixio_match_id": profixio_id,
             "official_result": fixture["official_result"],
@@ -371,7 +469,9 @@ def replace_profixio_events(match_id: str, events: list) -> pd.DataFrame:
         current["source"] == schema.SOURCE_PROFIXIO
     )
     kept = current[~imported]
-    incoming = pd.DataFrame(events, columns=schema.EVENT_COLUMNS)
+    # Buffer columns, not just the published ones: `recorded_at` arrives on
+    # each imported row and would be dropped by the narrower layout.
+    incoming = pd.DataFrame(events, columns=EVENT_BUFFER_COLUMNS)
     if len(incoming):
         incoming["synced"] = False
     save_events(concat_frames([kept, incoming]))
@@ -451,6 +551,52 @@ def copy_lineup(match_id: str, from_set: int, to_set: int) -> pd.DataFrame:
     ])
 
 
+def names_for_set(match_id: str, set_no: int) -> dict:
+    """shirt number -> name, as the line-up for this match records it.
+
+    The line-up is the authority on who wore a number *in this match*, and the
+    roster is not: shirt numbers are reassigned between matches, so looking a
+    name up in the roster stamps whoever wears that shirt now onto what whoever
+    wore it then actually did. Callers treat a missing number as "leave the
+    name alone" rather than blanking it.
+    """
+    rows = match_lineup(match_id, int(set_no))
+    return {
+        int(row["player_num"]): row["player_name"]
+        for row in rows.to_dict("records") if row["player_name"]
+    }
+
+
+def restamp_players(match_id: str, set_no: int = None) -> pd.DataFrame:
+    """Re-apply the line-up's names to events already recorded.
+
+    An event stores the name as it was when you tapped. Correct the line-up
+    afterwards - because a shirt changed hands between seasons, say - and the
+    events keep the old name unless it is pushed back through. The number is
+    the join; the line-up is the authority on who wore it in this match.
+    """
+    events = load_events()
+    target = events["match_id"] == match_id
+    if set_no is not None:
+        target &= events["set_no"] == int(set_no)
+    if not target.any():
+        return events
+
+    for set_number in sorted(events.loc[target, "set_no"].unique()):
+        names = names_for_set(match_id, int(set_number))
+        if not names:
+            continue
+        where = target & (events["set_no"] == set_number)
+        events.loc[where, "player_name"] = [
+            names.get(int(number), current)
+            for number, current in zip(
+                events.loc[where, "player_num"], events.loc[where, "player_name"]
+            )
+        ]
+    save_events(events)
+    return events
+
+
 def restamp_roles(match_id: str, set_no: int = None) -> pd.DataFrame:
     """Re-apply the lineup to events already recorded.
 
@@ -473,6 +619,24 @@ def restamp_roles(match_id: str, set_no: int = None) -> pd.DataFrame:
         )
     save_events(events)
     return events
+
+
+def protocol_count(match_id: str, set_no: int, number, action: str) -> int:
+    """How many of this action the official protocol already has for a player.
+
+    Shown while entering rather than used to block anything: the protocol is
+    usually right, but not every match is scored carefully, and a point put
+    against the wrong player has to be fixable.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id)
+        & (events["set_no"] == int(set_no))
+        & (events["player_num"] == int(number))
+        & (events["action"] == action)
+        & (events["source"] == schema.SOURCE_PROFIXIO)
+    ]
+    return len(rows)
 
 
 def has_profixio_events(match_id: str) -> bool:
@@ -511,3 +675,161 @@ def restore_events(remote: pd.DataFrame) -> dict:
         "already_here": len(remote) - len(fresh),
         "total": len(load_events()),
     }
+
+
+def lineup_from_events(match_id: str, set_no: int) -> list:
+    """Who actually appears in a set's recorded events.
+
+    Used to repair a line-up that has fallen behind the events - which happens
+    when shirt numbers change and a number-keyed match drops somebody who is
+    plainly there in the data.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id) & (events["set_no"] == int(set_no))
+    ]
+    seen, out = set(), []
+    for row in rows.to_dict("records"):
+        number = int(row["player_num"])
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append({
+            "player_num": number,
+            "player_name": row["player_name"],
+            "player_role": row["player_role"],
+        })
+    return sorted(out, key=lambda r: r["player_num"])
+
+
+def backfill_recorded_at() -> int:
+    """Give rows written before `recorded_at` existed a plausible order.
+
+    These stamps are ordering only. Nothing recorded when those rows were
+    actually entered, so this reconstructs the order they were *worked* in:
+    imported protocol rows first - a protocol is imported before the video is
+    picked over - then everything entered by hand, set by set, following `seq`
+    within each set. Spaced a second apart and landing just before now, so
+    anything recorded from here on sorts above all of it.
+
+    Returns how many rows were stamped. Rows that already carry a stamp are
+    left exactly as they are, so running it twice changes nothing.
+    """
+    events = load_events()
+    blank = events["recorded_at"].astype(str).str.strip() == ""
+    if not blank.any():
+        return 0
+
+    order = events[blank].copy()
+    order["_protocol"] = (order["source"] == schema.SOURCE_PROFIXIO).astype(int)
+    order = order.sort_values(
+        ["_protocol", "match_date", "match_id", "set_no", "seq"],
+        ascending=[False, True, True, True, True],
+        kind="stable",
+    )
+
+    start = datetime.now(timezone.utc) - timedelta(seconds=len(order) + 1)
+    stamps = {
+        event_id: (start + timedelta(seconds=offset)).strftime("%Y-%m-%dT%H:%M:%S")
+        for offset, event_id in enumerate(order["event_id"])
+    }
+    events.loc[blank, "recorded_at"] = [
+        stamps[event_id] for event_id in events.loc[blank, "event_id"]
+    ]
+    save_events(events)
+    return len(order)
+
+
+# --- reconciling what you entered with the official record ------------------
+
+def protocol_score(match_id: str, set_no: int):
+    """The official score at the end of a set, or None if there is no protocol.
+
+    When this exists the scoreboard follows it rather than counting along with
+    what you record - otherwise correcting one mis-attributed kill also adds a
+    point to the set, and the two records drift apart.
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id)
+        & (events["set_no"] == int(set_no))
+        & (events["source"] == schema.SOURCE_PROFIXIO)
+    ]
+    if not len(rows):
+        return None
+    return int(rows["score_us"].max()), int(rows["score_them"].max())
+
+
+def duplicate_candidates(match_id: str, set_no: int) -> pd.DataFrame:
+    """Point-scoring events in a set that already has an official protocol.
+
+    Only these can be duplicates: the protocol records nothing else, so a
+    reception or a dig you entered cannot collide with it and is never shown.
+
+    Returns both sources together, ordered so a manual event sits next to the
+    protocol events it matches, with `matches` counting how many the other
+    source holds for the same (player, action, result).
+    """
+    events = load_events()
+    rows = events[
+        (events["match_id"] == match_id) & (events["set_no"] == int(set_no))
+    ].copy()
+    if not len(rows):
+        return pd.DataFrame(
+            columns=list(events.columns)
+            + ["matches", "n_protocol", "n_manual", "keep"]
+        )
+
+    scoring = rows.apply(
+        lambda row: schema.is_point(row["action"], row["action_result"]), axis=1
+    )
+    rows = rows[scoring]
+    if schema.SOURCE_PROFIXIO not in set(rows["source"]):
+        return rows.iloc[0:0].assign(matches=0, n_protocol=0, n_manual=0, keep=True)
+
+    key = ["player_num", "action", "action_result"]
+    counts = rows.groupby(key + ["source"]).size().unstack("source", fill_value=0)
+
+    def other(row):
+        wanted = (
+            schema.SOURCE_PROFIXIO
+            if row["source"] == schema.SOURCE_MANUAL
+            else schema.SOURCE_MANUAL
+        )
+        index = tuple(row[column] for column in key)
+        if index not in counts.index or wanted not in counts.columns:
+            return 0
+        return int(counts.loc[index, wanted])
+
+    rows["matches"] = rows.apply(other, axis=1)
+
+    def side(row, source):
+        index = tuple(row[column] for column in key)
+        if index not in counts.index or source not in counts.columns:
+            return 0
+        return int(counts.loc[index, source])
+
+    # Both totals on every row of a group, so the note can state the same fact
+    # whichever row you are looking at.
+    rows["n_protocol"] = rows.apply(lambda r: side(r, schema.SOURCE_PROFIXIO), axis=1)
+    rows["n_manual"] = rows.apply(lambda r: side(r, schema.SOURCE_MANUAL), axis=1)
+    # The protocol is kept by default; a manual event is kept only when the
+    # protocol has nothing like it, which makes it a correction rather than a
+    # re-entry of a point that is already there.
+    #
+    # A row you have already reviewed keeps whatever you decided. Without that
+    # the guess is recomputed every rerun, so the extra aces you deliberately
+    # left behind - the protocol missed them - come back as deletion
+    # candidates for ever, and eventually get deleted by accident.
+    rows["keep"] = (
+        rows["reviewed"].astype(bool)
+        | (rows["source"] == schema.SOURCE_PROFIXIO)
+        | (rows["matches"] == 0)
+    )
+    return rows.sort_values(key + ["source"])
+
+
+def drop_events(event_ids) -> pd.DataFrame:
+    events = load_events()
+    save_events(events[~events["event_id"].isin(list(event_ids))])
+    return load_events()

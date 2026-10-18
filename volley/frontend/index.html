@@ -16,23 +16,19 @@
   }
   /* Bounding the *height* is what keeps 16:9 usable across the full page
      width - a percentage padding alone would make it 1000px tall. */
-  #player-wrap { max-width: calc(var(--max-h, 2000px) * 16 / 9); margin: 0 auto; }
-  #player-box {
+  #wrap { max-width: calc(var(--max-h, 2000px) * 16 / 9); margin: 0 auto; }
+  #box {
     position: relative; width: 100%; padding-top: 56.25%;
     background: #000; border-radius: 8px; overflow: hidden;
   }
-  #player-box > iframe, #player { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #player { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
   #placeholder {
-    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    text-align: center; padding: 1rem; color: var(--muted); font-size: 0.9rem; line-height: 1.5;
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; text-align: center; padding: 1rem;
+    color: var(--muted); font-size: 0.9rem; line-height: 1.5;
   }
   #bar {
-    display: flex; align-items: baseline; gap: 0.75rem;
     margin: 0.35rem 0 0; font-size: 0.78rem; color: var(--muted);
-  }
-  #clock {
-    font-variant-numeric: tabular-nums; font-size: 1.05rem; font-weight: 700;
-    color: var(--orange); letter-spacing: 0.02em;
   }
   kbd {
     background: var(--panel); border: 1px solid #2b3244; border-radius: 4px;
@@ -40,31 +36,30 @@
   }
 </style>
 
-<div id="player-wrap">
-<div id="player-box">
-  <div id="player"></div>
-  <div id="placeholder">Paste a YouTube URL for this match in the sidebar.<br>
-    Private videos cannot be embedded &mdash; unlisted works.</div>
-</div>
-</div>
-<div id="bar">
-  <span id="clock">0:00</span>
-  <span><kbd>space</kbd> play/pause &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> 5s &middot;
-    <kbd>shift</kbd> 1s</span>
+<div id="wrap">
+  <div id="box">
+    <iframe id="player" allow="accelerometer; encrypted-media; picture-in-picture"
+            allowfullscreen hidden></iframe>
+    <div id="placeholder">Add a YouTube URL for this match above.<br>
+      Private videos cannot be embedded &mdash; unlisted works.</div>
+  </div>
+  <div id="bar">
+    Click the video, then <kbd>k</kbd> play/pause &middot;
+    <kbd>j</kbd><kbd>l</kbd> 10s &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> 5s
+  </div>
 </div>
 
-<script src="https://www.youtube.com/iframe_api"></script>
 <script>
 (function () {
-  var player = null;
-  var apiReady = false;
-  var currentVideoId = "";
-  var pendingVideoId = "";
-
-  var clock = document.getElementById("clock");
+  // A plain embed, deliberately. This used to drive the YouTube IFrame API so
+  // Python could read the player clock; nothing needs that any more, and the
+  // API was the fragile part - if its script did not re-initialise after
+  // Streamlit rebuilt the frame, the panel sat on the placeholder for good.
+  // An <iframe src> cannot fail that way.
+  var current = "";
+  var player = document.getElementById("player");
   var placeholder = document.getElementById("placeholder");
 
-  // --- Streamlit component protocol ---------------------------------------
   function post(message) {
     message.isStreamlitMessage = true;
     window.parent.postMessage(message, "*");
@@ -73,71 +68,24 @@
     post({ type: "streamlit:setFrameHeight", height: document.body.scrollHeight + 2 });
   }
 
-  function currentSeconds() {
-    if (player && typeof player.getCurrentTime === "function") {
-      try { return player.getCurrentTime(); } catch (err) { return null; }
-    }
-    return null;
-  }
-
-  function formatTime(seconds) {
-    if (seconds === null || isNaN(seconds)) return "0:00";
-    var total = Math.floor(seconds);
-    var h = Math.floor(total / 3600);
-    var m = Math.floor((total % 3600) / 60);
-    var s = total % 60;
-    var mm = h ? String(m).padStart(2, "0") : String(m);
-    return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
-  }
-
-  // The clock ticks locally. It deliberately does NOT message Streamlit -
-  // that would rerun the app several times a second.
-  setInterval(function () { clock.textContent = formatTime(currentSeconds()); }, 250);
-
-  // --- player -------------------------------------------------------------
-  window.onYouTubeIframeAPIReady = function () {
-    apiReady = true;
-    if (pendingVideoId) createPlayer(pendingVideoId);
-  };
-
-  function createPlayer(videoId) {
-    placeholder.style.display = "none";
-    player = new YT.Player("player", {
-      videoId: videoId,
-      playerVars: { rel: 0, modestbranding: 1, playsinline: 1 }
-    });
-    currentVideoId = videoId;
-  }
-
   function applyVideo(videoId) {
-    if (!videoId) { return; }
-    // THE load-bearing check: only touch the player when the id actually
-    // changed. Reloading on every render would restart the video on every
-    // recorded event and defeat the whole feature.
-    if (videoId === currentVideoId) return;
-    if (!apiReady) { pendingVideoId = videoId; return; }
-    if (!player) { createPlayer(videoId); return; }
-    currentVideoId = videoId;
-    player.cueVideoById(videoId);   // cue, not load: never autoplay on a rerun
+    if (!videoId) {
+      current = "";
+      player.hidden = true;
+      player.removeAttribute("src");
+      placeholder.style.display = "";
+      return;
+    }
+    // Only touch src when the id actually changed: reassigning it reloads the
+    // iframe, which would restart the video on every recorded event and defeat
+    // the whole reason this is a component rather than an st.video call.
+    if (videoId === current) return;
+    current = videoId;
+    player.src = "https://www.youtube.com/embed/" + videoId +
+                 "?rel=0&modestbranding=1&playsinline=1";
+    player.hidden = false;
+    placeholder.style.display = "none";
   }
-
-  function seekBy(delta) {
-    var now = currentSeconds();
-    if (player && now !== null) player.seekTo(Math.max(0, now + delta), true);
-  }
-
-  function togglePlay() {
-    if (!player) return;
-    var state = player.getPlayerState();
-    if (state === YT.PlayerState.PLAYING) player.pauseVideo();
-    else player.playVideo();
-  }
-
-  document.addEventListener("keydown", function (ev) {
-    if (ev.key === "ArrowLeft") { ev.preventDefault(); seekBy(ev.shiftKey ? -1 : -5); return; }
-    if (ev.key === "ArrowRight") { ev.preventDefault(); seekBy(ev.shiftKey ? 1 : 5); return; }
-    if (ev.key === " ") { ev.preventDefault(); togglePlay(); return; }
-  });
 
   window.addEventListener("message", function (event) {
     var data = event.data;

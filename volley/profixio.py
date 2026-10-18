@@ -185,12 +185,15 @@ def parse_fixtures(html: str, team_name: str) -> list[dict]:
         opponent = away if is_home else home
 
         official_result, official_sets = "", ""
+        result_home, sets_home_text = "", ""
         if info.get("played") and len(numbers) >= 4 and len(numbers) % 2 == 0:
             sets_home, sets_away = numbers[-2], numbers[-1]
             pairs = [(numbers[i], numbers[i + 1]) for i in range(0, len(numbers) - 2, 2)]
+            result_home = f"{sets_home}-{sets_away}"
+            sets_home_text = ", ".join(f"{h}-{a}" for h, a in pairs)
             if is_home:
-                official_result = f"{sets_home}-{sets_away}"
-                official_sets = ", ".join(f"{h}-{a}" for h, a in pairs)
+                official_result = result_home
+                official_sets = sets_home_text
             else:
                 official_result = f"{sets_away}-{sets_home}"
                 official_sets = ", ".join(f"{a}-{h}" for h, a in pairs)
@@ -207,6 +210,8 @@ def parse_fixtures(html: str, team_name: str) -> list[dict]:
             "played": bool(info.get("played")),
             "official_result": official_result,
             "official_sets": official_sets,
+            "result_home": result_home,
+            "sets_home": sets_home_text,
         })
 
     fixtures.sort(key=lambda f: (f["date"], f["time"]))
@@ -363,10 +368,18 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
     """
     match_id = match.get("match_id", "")
     we_are_home = protocol.get("home", "").strip() == team_name.strip()
-    by_number = {}
+    # The whole protocol arrives at once, so every row shares one instant and
+    # `seq` is what orders them within it. That keeps an import together at the
+    # point in your history where you actually imported it, instead of looking
+    # like the newest thing you entered.
+    imported_at = store.now_stamp()
+    # Matched by name, never by number. Shirt numbers are reassigned between
+    # matches, so looking the roster up by number stamps whoever wears that
+    # shirt *now* onto points scored by whoever wore it *then*.
+    by_name = {}
     if roster is not None and len(roster):
         for player in roster.to_dict("records"):
-            by_number[int(player["number"])] = player
+            by_name[str(player["name"]).strip()] = player
 
     events = []
     set_no, seq = 1, 0
@@ -389,7 +402,7 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             continue
 
         action, result = mapped
-        known = by_number.get(row["number"], {})
+        known = by_name.get(str(row["player"]).strip(), {})
         seq += 1
         events.append({
             "match_id": match_id,
@@ -397,7 +410,8 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             "match_name": store.match_name(match),
             "set_no": set_no,
             "player_num": row["number"],
-            "player_name": known.get("name") or row["player"],
+            # The protocol is the record of who actually played in this match.
+            "player_name": row["player"] or known.get("name", ""),
             "player_role": "",
             "action": action,
             "action_result": result,
@@ -407,6 +421,7 @@ def protocol_to_events(protocol: dict, team_name: str, match: dict, roster=None)
             "seq": seq,
             "score_us": score_us,
             "score_them": score_them,
+            "recorded_at": imported_at,
         })
     return events
 
