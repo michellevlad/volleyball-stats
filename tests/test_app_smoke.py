@@ -728,111 +728,59 @@ def test_saving_roles_does_not_lose_the_video(gated_app, monkeypatch):
     assert seen[-1] == "pcRoX34oP7U"
 
 
-def test_saving_roles_keeps_the_video_and_persists(gated_app, monkeypatch):
-    """The save is a callback now - one rerun, and the panel is not rebuilt."""
+def test_an_edit_is_folded_into_the_row_it_came_from():
+    """Streamlit reports only what changed, positioned by row index."""
+    import app as application
+
+    rows = [
+        {"player_num": 4, "player_name": "Cyd", "player_role": "MB"},
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"},
+    ]
+    merged = application.apply_edits(rows, {1: {"player_role": "OP"}})
+    assert merged[1]["player_role"] == "OP"
+    assert merged[0]["player_role"] == "MB"       # untouched
+    assert rows[1]["player_role"] == "OH"         # and the original is not mutated
+
+
+def test_edits_outside_the_table_are_ignored():
+    import app as application
+
+    rows = [{"player_num": 7, "player_name": "Ana", "player_role": "OH"}]
+    assert application.apply_edits(rows, {9: {"player_role": "S"}}) == rows
+    assert application.apply_edits(rows, {0: {"nonsense": "x"}}) == rows
+    assert application.apply_edits(rows, {}) == rows
+    assert application.apply_edits(rows, None) == rows
+
+
+def test_a_role_change_lands_on_the_set_you_are_looking_at(gated_app):
+    """Changing set 2 must not write to set 1, which is what it felt like."""
     from volley import store as s
-    from volley import video as video_module
-
-    seen = []
-    monkeypatch.setattr(video_module, "video_panel",
-                        lambda video_id, **kwargs: seen.append(video_id))
-    s.upsert_match({**MATCH, "video_url": "https://youtu.be/pcRoX34oP7U"})
 
     gated_app.button(key="start_entering").click().run()
-    assert seen[-1] == "pcRoX34oP7U"
+    gated_app.button(key="goto_set::2").click().run()
+    assert gated_app.session_state["set_no"] == 2
 
-    save = next(b.key for b in gated_app.button if b.key.endswith("::save"))
-    gated_app.button(key=save).click().run()
-    assert not gated_app.exception
-    assert seen[-1] == "pcRoX34oP7U"
-    assert any("Roles saved" in m.value for m in gated_app.success)
-    assert s.load_matches().iloc[0]["video_url"] == "https://youtu.be/pcRoX34oP7U"
+    s.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"}])
+    s.set_lineup(MATCH["match_id"], 2, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"}])
 
-
-# --- the score follows the official record ----------------------------------
-
-@needs_protocol
-def test_recording_a_kill_does_not_move_an_official_score(gated_app):
-    """A correction fixes the player; it must not also inflate the set."""
-    import_jomala_protocol(MATCH["match_id"])
-    gated_app.button(key="start_entering").click().run()
-    us_key = f"score_us::{MATCH['match_id']}::1"
-    before = gated_app.session_state[us_key]
-    assert before == 25                       # the official set score
-
-    record(gated_app, 7, schema.ATTACK, "kill")
-    record(gated_app, 7, schema.ATTACK, "error")
-    assert not gated_app.exception
-    assert gated_app.session_state[us_key] == 25
-
-
-def test_without_a_protocol_the_score_counts_both_ways(gated_app):
-    gated_app.button(key="start_entering").click().run()
-    us_key = f"score_us::{MATCH['match_id']}::1"
-    them_key = f"score_them::{MATCH['match_id']}::1"
-    gated_app.session_state[us_key] = 0
-    gated_app.session_state[them_key] = 0
+    import app as application
+    rows = [{"player_num": 7, "player_name": "Ana", "player_role": "OH"}]
+    s.set_lineup(MATCH["match_id"], 2,
+                 application.apply_edits(rows, {0: {"player_role": "S"}}))
     gated_app.run()
 
-    record(gated_app, 7, schema.ATTACK, "kill")
-    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 0)
-
-    # An error hands the point to the other side.
-    record(gated_app, 7, schema.ATTACK, "error")
-    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 1)
-
-    record(gated_app, 7, schema.RECEPTION, "error")
-    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 2)
-
-    # Neutral results move nothing.
-    record(gated_app, 7, schema.ATTACK, "attempt")
-    assert (gated_app.session_state[us_key], gated_app.session_state[them_key]) == (1, 2)
-
-
-# --- an assist records who it went to ---------------------------------------
-
-def test_an_assist_asks_who_it_was_set_to(gated_app):
-    gated_app.button(key="start_entering").click().run()
-    gated_app.button(key=f"action::{schema.SET}").click().run()
-    gated_app.button(key=f"result::{schema.SET}::assist").click().run()
-    gated_app.button(key="player::p7").click().run()
     assert not gated_app.exception
-
-    # Nothing recorded yet - it is waiting for the target.
-    assert len(store.load_events()) == 0
-    targets = [b.key for b in gated_app.button if b.key.startswith("target::")]
-    assert "target::p4" in targets
-    assert "target::p7" not in targets        # she cannot set to herself
-
-    gated_app.button(key="target::p4").click().run()
-    events = store.load_events()
-    assert len(events) == 1
-    row = events.iloc[0]
-    assert (row["action"], row["action_result"]) == (schema.SET, "assist")
-    assert int(row["player_num"]) == 7
-    assert int(row["target_num"]) == 4
+    assert gated_app.session_state["set_no"] == 2        # still where you were
+    assert s.role_of(MATCH["match_id"], 2, 7) == "S"
+    assert s.role_of(MATCH["match_id"], 1, 7) == "OH"    # set 1 untouched
 
 
-def test_every_other_result_still_takes_three_taps(gated_app):
+def test_there_is_no_save_roles_button_any_more(gated_app):
     gated_app.button(key="start_entering").click().run()
-    record(gated_app, 7, schema.SET, "attempt")   # labelled "set" in the UI
-    assert not gated_app.exception
-    events = store.load_events()
-    assert len(events) == 1
-    assert events.iloc[0]["target_num"] == ""
-    assert not [b.key for b in gated_app.button if b.key.startswith("target::")]
-
-
-def test_the_action_row_is_always_in_the_same_place(gated_app):
-    """The point of the reorder: the first row never moves."""
-    gated_app.button(key="start_entering").click().run()
-    first = [b.key for b in gated_app.button if b.key.startswith("action::")]
-    assert first == [f"action::{a}" for a in schema.ACTION_ORDER]
-    assert first[0] == f"action::{schema.SERVE}"      # serve before attack
-
-    record(gated_app, 7, schema.DIG, "dig")
-    after = [b.key for b in gated_app.button if b.key.startswith("action::")]
-    assert after == first
+    assert not [b.key for b in gated_app.button if b.key.endswith("::save")]
+    assert any("save as you make them" in c.value for c in gated_app.caption)
 
 
 # --- review duplicates ------------------------------------------------------

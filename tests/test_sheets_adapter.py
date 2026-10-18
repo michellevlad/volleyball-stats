@@ -36,6 +36,10 @@ class FakeWorksheet:
             for col_offset, cell in enumerate(incoming):
                 line[col - 1 + col_offset] = cell
 
+    def batch_update(self, updates, **kwargs):
+        for update in updates:
+            self.update(values=update["values"], range_name=update["range"])
+
     def append_rows(self, rows, **kwargs):
         self.values.extend([list(row) for row in rows])
 
@@ -189,7 +193,8 @@ def make_events(n=2, match_id="m1", set_no=1):
             "match_name": "Elden VBK vs Lions", "set_no": set_no,
             "player_num": 7, "player_name": "Ana", "player_role": "OH",
             "action": schema.ATTACK, "action_result": "kill", "is_point": True,
-            "source": schema.SOURCE_MANUAL, "event_id": f"e{set_no}-{index}",
+            "source": schema.SOURCE_MANUAL,
+            "event_id": f"{match_id}-s{set_no}-{index}",
             "seq": index + 1, "score_us": index + 1, "score_them": 0,
         })
     return pd.DataFrame(rows, columns=schema.EVENT_COLUMNS)
@@ -291,9 +296,10 @@ def test_events_can_be_archived_as_well(spreadsheet, monkeypatch):
     assert set(result["tabs"]) == {schema.TAB_SET_STATS, schema.TAB_EVENTS}
     assert result["tabs"][schema.TAB_EVENTS] == 2
 
-    # ...and that one *is* deduplicated, because it appends.
+    # ...and nothing is added twice when the same events are pushed again.
     again = sheets.push(spreadsheet, make_events(2), make_matches())
     assert again["tabs"][schema.TAB_EVENTS] == 0
+    assert again["corrected"] == 0
 
 
 # --- auth failure messages --------------------------------------------------
@@ -566,3 +572,68 @@ def test_a_push_never_touches_a_tab_it_does_not_own():
     assert spreadsheet.worksheet("Track_Stats").values == theirs
     assert spreadsheet.worksheet("Roaster").values == roster_tab
     assert spreadsheet.worksheet("Team").values == [["Number", "Name"]]
+
+
+# --- the archive corrects itself --------------------------------------------
+
+def test_a_corrected_name_reaches_rows_already_in_the_sheet(spreadsheet):
+    """Append-only was not enough: a row written months ago kept the old name."""
+    events = make_events(2)
+    sheets.push(spreadsheet, events, make_matches())
+    tab = spreadsheet.worksheet(schema.TAB_EVENTS)
+    assert {dict(zip(tab.values[0], r))["player_name"] for r in tab.values[1:]} == {"Ana"}
+
+    corrected = events.assign(player_name="Luisa")
+    result = sheets.push(spreadsheet, corrected, make_matches())
+    assert result["corrected"] == 2
+    assert result["tabs"][schema.TAB_EVENTS] == 2
+
+    rows = [dict(zip(tab.values[0], r)) for r in tab.values[1:]]
+    assert {r["player_name"] for r in rows} == {"Luisa"}
+    assert len(rows) == 2, "correcting must not duplicate the row"
+
+
+def test_deleting_an_event_locally_removes_it_from_the_archive(spreadsheet):
+    """Otherwise Restore would resurrect everything Review duplicates removed."""
+    sheets.push(spreadsheet, make_events(3, match_id="m1"), make_matches("m1"))
+    result = sheets.push(spreadsheet, make_events(1, match_id="m1"), make_matches("m1"))
+
+    assert result["removed"] == 2
+    tab = spreadsheet.worksheet(schema.TAB_EVENTS)
+    assert len(tab.values) - 1 == 1
+
+
+def test_a_match_this_machine_does_not_hold_is_left_alone(spreadsheet):
+    """That is what makes the archive survive a local loss."""
+    sheets.push(spreadsheet, make_events(3, match_id="m1"), make_matches("m1"))
+    result = sheets.push(spreadsheet, make_events(2, match_id="m2"), make_matches("m2"))
+
+    assert result["removed"] == 0
+    rows = [dict(zip(spreadsheet.worksheet(schema.TAB_EVENTS).values[0], r))
+            for r in spreadsheet.worksheet(schema.TAB_EVENTS).values[1:]]
+    assert sorted(r["match_id"] for r in rows) == ["m1"] * 3 + ["m2"] * 2
+
+
+def test_an_unchanged_push_writes_nothing(spreadsheet):
+    events = make_events(3)
+    sheets.push(spreadsheet, events, make_matches())
+    before = [list(row) for row in spreadsheet.worksheet(schema.TAB_EVENTS).values]
+
+    result = sheets.push(spreadsheet, events, make_matches())
+    assert result["corrected"] == 0
+    assert [list(r) for r in spreadsheet.worksheet(schema.TAB_EVENTS).values] == before
+
+
+def test_columns_the_app_does_not_know_about_survive_a_correction():
+    worksheet = FakeWorksheet("Events", [
+        schema.EVENT_COLUMNS + ["Comentario"],
+        ["m1", "2026-09-27", "Elden VBK vs Lions", "1", "7", "Ana", "OH",
+         schema.ATTACK, "kill", "True", "", schema.SOURCE_MANUAL, "m1-s1-0", "1", "1", "0",
+         "from the pipe"],
+    ])
+    corrected = make_events(1).assign(player_name="Luisa")
+    sheets.mirror_rows_by_id(worksheet, corrected, schema.EVENT_COLUMNS)
+
+    row = dict(zip(worksheet.values[0], worksheet.values[1]))
+    assert row["player_name"] == "Luisa"
+    assert row["Comentario"] == "from the pipe"

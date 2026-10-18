@@ -311,6 +311,9 @@ With that set, **⬇ Restore from Sheets** in the sidebar pulls the archived eve
 additive — events already on this machine are left exactly as they are, so restoring can never
 overwrite work in progress, and restoring twice changes nothing.
 
+Corrections flow the other way on a push: fix a name or delete an event here, and the next push
+makes the sheet match for that match. So the two never drift.
+
 Available names: `PlayerSetStats`, `Events`, `Matches`, `Lineup`, `PlayerMatchStats`,
 `TeamMatchStats`, `PlayerRoleStats`. `Events`, `Matches` and `Lineup` append and deduplicate;
 the rest are rebuilt each push.
@@ -323,8 +326,12 @@ but none of the attempts, errors, receptions or digs you watched for.
 
 When a push writes into a tab that already has its own columns, it fits in around them:
 
-- **Rows are added, never rewritten.**
-- **Columns are matched by name**; unrecognised ones are left blank in new rows.
+- **A match this machine holds is mirrored.** Corrections reach rows written weeks ago, and events
+  you delete stop coming back — without that, Restore would resurrect everything Review duplicates
+  had just removed.
+- **A match this machine has never seen is left exactly as it is.** That is what makes the archive
+  worth keeping after a local loss.
+- **Columns are matched by name**; ones the app doesn't recognise are carried across untouched.
 - **Columns it needs but can't find are added on the far right.** Nothing is reordered.
 
 Use **Tab mapping** in the sidebar to say which of your tabs holds what.

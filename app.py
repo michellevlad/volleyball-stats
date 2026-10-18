@@ -215,23 +215,44 @@ def cb_start_entering(match_id: str) -> None:
     st.session_state.setup_done_for = match_id
 
 
-def cb_save_roles(match_id: str, set_no: int, edited, players: list) -> None:
-    by_number = {int(player["number"]): player for player in players}
-    rows = []
-    for record in edited.to_dict("records"):
-        if by_number.get(int(record["player_num"])) is None:
-            continue
-        rows.append({
-            "player_num": int(record["player_num"]),
-            "player_name": record["player_name"],
-            "player_role": str(record["player_role"] or ""),
-        })
-    store.set_lineup(match_id, set_no, rows)
+def apply_edits(rows: list, edits: dict) -> list:
+    """Fold a data editor's edits back into the rows it was built from.
+
+    Streamlit reports them as {"edited_rows": {row index: {column: value}}} -
+    only what changed, positioned by row. Kept separate from the callback so it
+    can be tested without a script run.
+    """
+    merged = [dict(row) for row in rows]
+    for index, changed in (edits or {}).items():
+        index = int(index)
+        if 0 <= index < len(merged):
+            merged[index].update(
+                {key: value for key, value in changed.items() if key in merged[index]}
+            )
+    return merged
+
+
+def cb_roles_changed(match_id: str, set_no: int, rows: list, key: str) -> None:
+    """Save a role the moment it is picked.
+
+    A separate Save button was a step too many - you change the dropdown and
+    expect it to be changed.
+    """
+    edits = (st.session_state.get(key) or {}).get("edited_rows", {})
+    if not edits:
+        return
+    store.set_lineup(match_id, set_no, [
+        {
+            "player_num": int(row["player_num"]),
+            "player_name": row["player_name"],
+            "player_role": str(row["player_role"] or ""),
+        }
+        for row in apply_edits(rows, edits)
+    ])
     # Events already recorded carry the name and role as they were when you
     # tapped; push the correction through so the two cannot quietly disagree.
     store.restamp_players(match_id, set_no)
     store.restamp_roles(match_id, set_no)
-    flash("success", f"Roles saved for set {set_no}")
 
 
 def cb_save_video_url(match: dict) -> None:
@@ -915,11 +936,14 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
         }
         for player in players
     ])
-    edited = st.data_editor(
+    rows = frame.to_dict("records")
+    st.data_editor(
         frame,
         key=key,
         hide_index=True,
         width="stretch",
+        on_change=cb_roles_changed,
+        args=(match_id, set_no, rows, key),
         column_config={
             "player_num": st.column_config.NumberColumn("#", disabled=True),
             "player_name": st.column_config.TextColumn("player", disabled=True),
@@ -928,10 +952,7 @@ def role_editor(match_id: str, set_no: int, players: list, key: str) -> None:
             ),
         },
     )
-    # A callback rather than an inline branch with st.rerun(): one rerun cycle
-    # instead of two, and the video panel is not torn down and rebuilt.
-    st.button("Save roles", key=f"{key}::save", width="stretch",
-              on_click=cb_save_roles, args=(match_id, set_no, edited, players))
+    st.caption("Changes save as you make them.")
 
 
 def ensure_set_lineup(match_id: str, set_no: int, roster: pd.DataFrame, match: dict) -> None:
