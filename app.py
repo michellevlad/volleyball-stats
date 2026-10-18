@@ -985,6 +985,24 @@ def save_squad(match_id: str, set_no: int = 1) -> None:
     store.restamp_roles(match_id, set_no)
 
 
+def default_match_id(matches: pd.DataFrame) -> str:
+    """The match you most likely want: the last one played, else the next one up.
+
+    Matches are stored newest-first, so falling back to row zero would land on
+    the final fixture of the season - never the useful answer.
+    """
+    if not len(matches):
+        return ""
+    played = matches[matches["official_result"].astype(str) != ""]
+    if len(played):
+        return played.sort_values("date").iloc[-1]["match_id"]
+    today = date.today().isoformat()
+    upcoming = matches[matches["date"].astype(str) >= today].sort_values("date")
+    if len(upcoming):
+        return upcoming.iloc[0]["match_id"]
+    return matches.sort_values("date").iloc[-1]["match_id"]
+
+
 def setup_screen(matches: pd.DataFrame, roster: pd.DataFrame) -> None:
     st.subheader("Match setup")
 

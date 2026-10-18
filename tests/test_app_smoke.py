@@ -587,3 +587,51 @@ def test_the_lineup_carries_into_the_next_set(gated_app):
     last = s.load_events().iloc[-1]
     assert int(last["set_no"]) == 2
     assert last["player_role"] == "OP"
+
+
+# --- opening the app cold ---------------------------------------------------
+
+def test_the_app_opens_with_no_match_chosen(temp_store, monkeypatch):
+    """The path a real first launch takes - no match_id in session state.
+
+    Every other test presets one, which is how a missing default_match_id
+    survived a green suite and broke the app on open.
+    """
+    monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
+    store.save_roster(pd.DataFrame([
+        {"player_id": "", "number": 7, "name": "Ana", "position": "OH", "active": True},
+    ]))
+    store.upsert_match({**MATCH, "official_result": "3-0",
+                        "official_sets": "25-9, 25-5, 25-6"})
+
+    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    assert not app.exception
+    assert any("Match setup" in s.value for s in app.subheader)
+    # It lands on the played match rather than the last fixture of the season.
+    assert app.selectbox(key="setup_match").value == MATCH["match_id"]
+
+
+def test_opening_cold_with_no_matches_at_all(temp_store, monkeypatch):
+    monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
+    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    assert not app.exception
+    assert any("No matches yet" in i.value for i in app.info)
+
+
+def test_the_default_match_is_the_last_one_played(temp_store, monkeypatch):
+    monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
+    for date_, opponent, result in (
+        ("2026-09-26", "Jomala IK C", "3-0"),
+        ("2026-10-03", "Jomala IK B", "3-0"),
+        ("2026-11-15", "Taby Volley C", ""),
+    ):
+        store.upsert_match({
+            "match_id": f"{date_}-{opponent.lower().replace(' ', '-')}",
+            "date": date_, "opponent": opponent, "home_away": "home",
+            "competition": "", "sets_won": 0, "sets_lost": 0, "video_url": "",
+            "profixio_match_id": "", "squad": "", "official_result": result,
+            "official_sets": "", "notes": "",
+        })
+    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    assert not app.exception
+    assert app.selectbox(key="setup_match").value == "2026-10-03-jomala-ik-b"
