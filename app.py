@@ -1126,7 +1126,16 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
     the rerun, which matters because the video component is in here: fewer
     render passes, no chance of the player being disturbed by unrelated work.
     """
+    # A fragment keeps the arguments it was called with, so anything saved from
+    # inside it - the video URL, the squad, the roles - would still read back as
+    # it was at the last full rerun. Re-read the match row instead of trusting
+    # what was passed in.
     match_id = match["match_id"]
+    matches = store.load_matches()
+    current = matches[matches["match_id"] == match_id]
+    if len(current):
+        match = current.iloc[0].to_dict()
+
     set_no = int(st.session_state.set_no)
     show_video = st.session_state.show_video
     # Set here, not inside the panel: collapsing the video must not stop events

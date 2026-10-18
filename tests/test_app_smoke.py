@@ -668,3 +668,49 @@ def test_the_import_button_actually_imports(gated_app, monkeypatch):
     assert set(events["match_name"]) == {"Elden VBK vs Lions"}   # a home game
     assert set(events["match_date"]) == {MATCH["date"]}
     assert any("52 events" in s.value for s in gated_app.success)
+
+
+# --- the workspace is a fragment, so it must not trust stale arguments ------
+
+def test_linking_a_video_from_the_workspace_takes_effect(gated_app, monkeypatch):
+    """A fragment keeps its arguments; saving inside it must still be seen."""
+    from volley import video as video_module
+
+    seen = []
+    monkeypatch.setattr(video_module, "video_panel",
+                        lambda video_id, **kwargs: seen.append(video_id))
+    store.upsert_match({**MATCH, "video_url": ""})
+
+    gated_app.button(key="start_entering").click().run()
+    assert seen and seen[-1] is None          # no video on this match yet
+
+    gated_app.text_input(key="video_url_input").set_value(
+        "https://www.youtube.com/watch?v=pcRoX34oP7U&list=PLAelY3l5Ko3o&index=2"
+    ).run()
+    gated_app.button(key="save_video_url").click().run()
+    assert not gated_app.exception
+
+    assert seen[-1] == "pcRoX34oP7U", "the panel was handed a stale match row"
+    stored = store.load_matches().iloc[0]["video_url"]
+    assert "pcRoX34oP7U" in stored
+
+
+def test_saving_roles_does_not_lose_the_video(gated_app, monkeypatch):
+    from volley import store as s
+    from volley import video as video_module
+
+    seen = []
+    monkeypatch.setattr(video_module, "video_panel",
+                        lambda video_id, **kwargs: seen.append(video_id))
+    s.upsert_match({**MATCH, "video_url": "https://youtu.be/pcRoX34oP7U"})
+
+    gated_app.button(key="start_entering").click().run()
+    assert seen[-1] == "pcRoX34oP7U"
+
+    # Saving the set's roles must leave the video exactly where it was.
+    s.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OP"},
+    ])
+    gated_app.run()
+    assert not gated_app.exception
+    assert seen[-1] == "pcRoX34oP7U"
