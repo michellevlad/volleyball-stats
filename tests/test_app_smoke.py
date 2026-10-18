@@ -14,6 +14,10 @@ from volley import schema, store, video
 
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
 
+# Streamlit 1.66 resolves a relative script path against the file that calls
+# from_file, not the working directory, so this has to be absolute.
+APP = str(Path(__file__).resolve().parent.parent / "app.py")
+
 VIDEO_URL = "https://youtu.be/dQw4w9WgXcQ"
 
 def offline(app):
@@ -61,7 +65,7 @@ def app(temp_store, monkeypatch):
         {"player_id": "", "number": 12, "name": "Bea", "position": "S", "active": True},
     ]))
     store.upsert_match(MATCH)
-    return past_setup(AppTest.from_file("app.py", default_timeout=30)).run()
+    return past_setup(AppTest.from_file(APP, default_timeout=30)).run()
 
 
 def test_app_renders_without_exceptions(app):
@@ -113,7 +117,7 @@ def test_score_is_restored_from_the_buffer_on_a_fresh_session(app):
     record(app, 7, schema.SERVE, "ace")
     assert store.load_events().iloc[-1]["score_us"] == 2
 
-    restarted = past_setup(AppTest.from_file("app.py", default_timeout=30))
+    restarted = past_setup(AppTest.from_file(APP, default_timeout=30))
     restarted.run()
     assert not restarted.exception
     assert restarted.session_state[f"score_us::{MATCH['match_id']}::1"] == 2
@@ -149,7 +153,7 @@ def app_with_video(temp_store, monkeypatch):
 
     box = {"payload": None}
     monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: box["payload"])
-    return past_setup(AppTest.from_file("app.py", default_timeout=30)), box
+    return past_setup(AppTest.from_file(APP, default_timeout=30)), box
 
 
 def test_events_are_still_recorded_with_no_video_linked(temp_store, monkeypatch):
@@ -160,7 +164,7 @@ def test_events_are_still_recorded_with_no_video_linked(temp_store, monkeypatch)
     store.upsert_match({**MATCH, "video_url": ""})
     monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
 
-    app = past_setup(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
     record(app, 7, schema.ATTACK, "kill")
     assert not app.exception
 
@@ -187,7 +191,7 @@ def blank_app(temp_store, monkeypatch):
 def test_runs_without_a_logo_file(blank_app):
     tmp_path, monkeypatch = blank_app
     monkeypatch.setenv("VOLLEY_LOGO", str(tmp_path / "missing.png"))
-    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = offline(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
     assert any("Elden VBK" in title.value for title in app.title)
 
@@ -197,7 +201,7 @@ def test_renders_the_logo_when_the_file_is_there(blank_app):
     logo = tmp_path / "elden-vbk.png"
     logo.write_bytes(TINY_PNG)
     monkeypatch.setenv("VOLLEY_LOGO", str(logo))
-    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = offline(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
     assert any("Elden VBK" in title.value for title in app.title)
 
@@ -215,7 +219,7 @@ def gated_app(temp_store, monkeypatch):
     ]))
     store.upsert_match({**MATCH, "official_result": "3-0",
                         "official_sets": "25-9, 25-5, 25-6"})
-    app = offline(AppTest.from_file("app.py", default_timeout=30))
+    app = offline(AppTest.from_file(APP, default_timeout=30))
     app.session_state["match_id"] = MATCH["match_id"]
     return app.run()
 
@@ -524,7 +528,7 @@ def test_no_comparison_without_an_official_result(temp_store, monkeypatch):
     ]))
     store.upsert_match({**MATCH, "official_result": "", "official_sets": ""})
 
-    app = past_setup(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
     record(app, 7, schema.ATTACK, "attempt")
     assert not app.exception
     assert comparison_table(app) is None
@@ -604,7 +608,7 @@ def test_the_app_opens_with_no_match_chosen(temp_store, monkeypatch):
     store.upsert_match({**MATCH, "official_result": "3-0",
                         "official_sets": "25-9, 25-5, 25-6"})
 
-    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = offline(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
     assert any("Match setup" in s.value for s in app.subheader)
     # It lands on the played match rather than the last fixture of the season.
@@ -613,7 +617,7 @@ def test_the_app_opens_with_no_match_chosen(temp_store, monkeypatch):
 
 def test_opening_cold_with_no_matches_at_all(temp_store, monkeypatch):
     monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
-    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = offline(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
     assert any("No matches yet" in i.value for i in app.info)
 
@@ -632,7 +636,7 @@ def test_the_default_match_is_the_last_one_played(temp_store, monkeypatch):
             "profixio_match_id": "", "squad": "", "official_result": result,
             "official_sets": "", "notes": "",
         })
-    app = offline(AppTest.from_file("app.py", default_timeout=30)).run()
+    app = offline(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
     assert app.selectbox(key="setup_match").value == "2026-10-03-jomala-ik-b"
 
