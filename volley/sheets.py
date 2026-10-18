@@ -375,6 +375,38 @@ def _merge_lineup(spreadsheet, lineup: pd.DataFrame) -> pd.DataFrame:
     return merged.drop_duplicates(["match_id", "set_no", "player_num"], keep="first")
 
 
+NUMERIC_STAT_COLUMNS = ("set_no", "player_num", "sets_played")
+
+
+def upsert_by_match(spreadsheet, title: str, df: pd.DataFrame, columns: list[str]) -> int:
+    """Replace the rows for the matches we hold; leave every other match alone.
+
+    An aggregate row is a summary, not a fact - it changes as you enter more -
+    so it has to be rewritten rather than appended. But rewriting the *whole*
+    tab makes it a mirror of this one machine: lose the local buffer, push, and
+    the sheet empties with it. Scoping the rewrite to the matches present
+    locally keeps corrections and deletions working inside a match while a
+    match this machine has never seen simply stays where it is.
+    """
+    remote = read_tab(spreadsheet, title, columns)
+    ours = set(df["match_id"]) if len(df) else set()
+    kept = remote[~remote["match_id"].isin(ours)] if len(remote) else remote
+
+    merged = store.concat_frames([kept, df]).reindex(columns=columns)
+    if len(merged):
+        for column in NUMERIC_STAT_COLUMNS:
+            if column in merged.columns:
+                merged[column] = (
+                    pd.to_numeric(merged[column], errors="coerce").fillna(0).astype(int)
+                )
+        sort_by = [c for c in ("match_date", "match_id", "set_no", "player_num")
+                   if c in merged.columns]
+        merged = merged.sort_values(sort_by)
+
+    replace_tab(spreadsheet, title, merged, columns)
+    return len(merged)
+
+
 def read_events(spreadsheet, title: str | None = None) -> pd.DataFrame:
     """Read the archived raw events back out of the spreadsheet.
 
@@ -417,9 +449,10 @@ def push(spreadsheet, events: pd.DataFrame, matches: pd.DataFrame,
             )
 
     if schema.TAB_SET_STATS in wanted:
-        per_set = stats.player_set_stats(events)
-        replace_tab(spreadsheet, schema.TAB_SET_STATS, per_set, schema.SET_STATS_COLUMNS)
-        written[schema.TAB_SET_STATS] = len(per_set)
+        written[schema.TAB_SET_STATS] = upsert_by_match(
+            spreadsheet, schema.TAB_SET_STATS,
+            stats.player_set_stats(events), schema.SET_STATS_COLUMNS,
+        )
 
     # The rest are opt-in, and behave as they always did.
     if schema.TAB_EVENTS in wanted:
