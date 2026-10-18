@@ -186,3 +186,37 @@ def test_two_players_cannot_share_a_shirt_in_one_set():
                                 {"match_id": "m1"}, 1)
     assert list(squad["number"]) == [4]
     assert list(squad["name"]) == ["Luisa"]
+
+
+def test_correcting_the_lineup_fixes_names_on_events_already_recorded():
+    """A shirt that changed hands between seasons must not rewrite history."""
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Maryam", "player_role": "S"},
+    ])
+    store.append_event(make_event(set_no=1, seq=1))
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=2,
+        player={"player_id": "p4", "number": 4, "name": "Maryam"},
+        action=schema.ATTACK, result="kill",
+    ))
+    assert "Maryam" in set(store.load_events()["player_name"])
+
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+    ])
+    store.restamp_players("m1", 1)
+
+    events = store.load_events()
+    four = events[events["player_num"] == 4]
+    assert set(four["player_name"]) == {"Luisa"}
+    # Everyone else is left alone.
+    assert set(events[events["player_num"] == 7]["player_name"]) == {"Ana"}
+
+
+def test_restamping_leaves_a_number_the_lineup_does_not_mention():
+    store.set_lineup("m1", 1, [
+        {"player_num": 4, "player_name": "Luisa", "player_role": "S"},
+    ])
+    store.append_event(make_event(set_no=1, seq=1))      # #7 Ana, not in the line-up
+    store.restamp_players("m1", 1)
+    assert set(store.load_events()["player_name"]) == {"Ana"}

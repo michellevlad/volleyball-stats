@@ -227,8 +227,9 @@ def cb_save_roles(match_id: str, set_no: int, edited, players: list) -> None:
             "player_role": str(record["player_role"] or ""),
         })
     store.set_lineup(match_id, set_no, rows)
-    # Events already recorded carry a role; push the change through so the two
-    # cannot quietly disagree.
+    # Events already recorded carry the name and role as they were when you
+    # tapped; push the correction through so the two cannot quietly disagree.
+    store.restamp_players(match_id, set_no)
     store.restamp_roles(match_id, set_no)
     flash("success", f"Roles saved for set {set_no}")
 
@@ -838,7 +839,8 @@ def import_protocol(match: dict, pdf_bytes: bytes) -> None:
             flash("error", f"No {team} events found in that protocol - wrong match?")
             return
         store.replace_profixio_events(match["match_id"], events)
-        store.restamp_roles(match["match_id"])   # imported rows get roles too
+        store.restamp_players(match["match_id"])  # imported rows get the line-up's
+        store.restamp_roles(match["match_id"])    # names and roles
         flash("success",
               f"{summary['rows']} rows → {len(events)} events · "
               f"{summary['points_for']}-{summary['points_against']} points · "
@@ -1076,7 +1078,20 @@ def squad_editor(roster: pd.DataFrame, match: dict, set_no: int = 1) -> None:
     called_names = set(numbered)
     called_numbers = set(store.squad_numbers(match))
 
-    players = roster.sort_values("number").to_dict("records")
+    # Where a line-up exists it is the authority on who played and what they
+    # wore; the roster only supplies anyone not in it yet. Otherwise a player
+    # whose shirt has since changed hands gets overwritten by whoever has it
+    # now, every time this screen is opened.
+    players = [
+        {"number": int(r["player_num"]), "name": r["player_name"],
+         "position": r["player_role"], "active": True}
+        for r in records
+    ]
+    present = {p["name"] for p in players}
+    players += [
+        p for p in roster.sort_values("number").to_dict("records")
+        if p["name"] not in present
+    ]
     frame = pd.DataFrame([
         {
             "called": (player["name"] in called_names) if called_names
@@ -1129,6 +1144,7 @@ def save_squad(match_id: str, set_no: int = 1) -> None:
         }
         for row in picked.to_dict("records")
     ])
+    store.restamp_players(match_id, set_no)
     store.restamp_roles(match_id, set_no)
 
 

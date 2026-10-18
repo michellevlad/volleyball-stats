@@ -513,6 +513,40 @@ def copy_lineup(match_id: str, from_set: int, to_set: int) -> pd.DataFrame:
     ])
 
 
+def restamp_players(match_id: str, set_no: int = None) -> pd.DataFrame:
+    """Re-apply the line-up's names to events already recorded.
+
+    An event stores the name as it was when you tapped. Correct the line-up
+    afterwards - because a shirt changed hands between seasons, say - and the
+    events keep the old name unless it is pushed back through. The number is
+    the join; the line-up is the authority on who wore it in this match.
+    """
+    events = load_events()
+    target = events["match_id"] == match_id
+    if set_no is not None:
+        target &= events["set_no"] == int(set_no)
+    if not target.any():
+        return events
+
+    for set_number in sorted(events.loc[target, "set_no"].unique()):
+        rows = match_lineup(match_id, int(set_number))
+        names = {
+            int(row["player_num"]): row["player_name"]
+            for row in rows.to_dict("records") if row["player_name"]
+        }
+        if not names:
+            continue
+        where = target & (events["set_no"] == set_number)
+        events.loc[where, "player_name"] = [
+            names.get(int(number), current)
+            for number, current in zip(
+                events.loc[where, "player_num"], events.loc[where, "player_name"]
+            )
+        ]
+    save_events(events)
+    return events
+
+
 def restamp_roles(match_id: str, set_no: int = None) -> pd.DataFrame:
     """Re-apply the lineup to events already recorded.
 
