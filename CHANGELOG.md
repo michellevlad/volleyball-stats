@@ -33,6 +33,10 @@ sidebar, so the running app can always be matched to an entry here.
   scored, so a set that ended on opponent errors is missing its last points
   until you add them.
 
+### Fixed
+- Reopening the app no longer throws away points added by hand to a set that
+  has a protocol. The protocol is treated as a floor, not as the whole truth.
+
 ## [0.3.0] - 2026-10-18
 
 Entering a whole match from video, end to end (#3, #5).

@@ -498,7 +498,7 @@ read the player clock, and once that was no longer needed it was pure risk: if i
 re-initialise after a rebuild, the panel stayed blank.
 
 ```bash
-.venv/bin/python -m pytest -q      # 311 tests
+.venv/bin/python -m pytest -q      # 312 tests
 ```
 
 ### Releasing

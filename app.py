@@ -98,7 +98,13 @@ def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None
     st.session_state.setdefault(auto_score_key(match_id, set_no), official is None)
     if us_key in st.session_state and them_key in st.session_state:
         return
-    us, them = official if official else store.current_score(events, match_id, set_no)
+    us, them = store.current_score(events, match_id, set_no)
+    if official:
+        # The protocol is a floor, not a ceiling. It only knows the points our
+        # own players scored, so a set that ended on opponent errors stops short
+        # of the real score - and reopening the app must not throw away the
+        # points you added by hand to get there.
+        us, them = max(us, official[0]), max(them, official[1])
     st.session_state.setdefault(us_key, us)
     st.session_state.setdefault(them_key, them)
 

@@ -1247,3 +1247,23 @@ def test_picking_a_name_moves_the_event_to_that_player(app):
     saved = store.load_events().iloc[0]
     assert saved["player_name"] == "Bea"
     assert saved["player_num"] == 12          # the shirt follows the name
+
+
+@needs_protocol
+def test_a_reopened_set_keeps_the_points_you_added_by_hand(gated_app):
+    """The protocol stops at the last point our own players scored.
+
+    A set that finished on opponent errors is ahead of its protocol, and that
+    lead was being thrown away every time the app was opened again.
+    """
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    us_key = f"score_us::{MATCH['match_id']}::1"
+    official = int(gated_app.session_state[us_key])
+
+    gated_app.button(key=f"bump::{us_key}").click().run()      # an opponent error
+    assert int(gated_app.session_state[us_key]) == official + 1
+    record(gated_app, 7, schema.DIG, "dig")                    # carries it onto an event
+
+    fresh = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
+    assert int(fresh.session_state[us_key]) == official + 1
