@@ -50,7 +50,9 @@ ACTION_ORDER = [SERVE, ATTACK, RECEPTION, DIG, BLOCK, SET]
 RESULT_LABELS = {
     (BLOCK, "kill"): "block point",
     (BLOCK, "attempt"): "touch",
-    (SET, "attempt"): "set",
+    # Plain "set" read the same as the set being entered, which is a different
+    # thing entirely.
+    (SET, "attempt"): "set attempt",
 }
 
 # Results that end the rally in our favour and so bump our score by one.

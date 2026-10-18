@@ -10,7 +10,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from volley import config, profixio, schema, sheets, stats, store, video
+from volley import __version__, config, profixio, schema, sheets, stats, store, video
 
 LOGO = config.logo_path()
 
@@ -41,6 +41,7 @@ def init_state() -> None:
         "sel_action": None,
         "sel_result": None,
         "sel_player": None,
+        "sel_target": None,
         "flash": None,
         "spreadsheet": None,
         "spreadsheet_title": "",
@@ -73,6 +74,15 @@ def score_keys(match_id: str, set_no: int) -> tuple[str, str]:
     return f"score_us::{match_id}::{set_no}", f"score_them::{match_id}::{set_no}"
 
 
+def auto_score_key(match_id: str, set_no: int) -> str:
+    return f"auto_score::{match_id}::{set_no}"
+
+
+def auto_score(match_id: str, set_no: int) -> bool:
+    """Is this set's score ours to keep as we record, or kept by hand?"""
+    return bool(st.session_state.get(auto_score_key(match_id, set_no), False))
+
+
 def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None:
     """Seed the score widgets, preferring the official record.
 
@@ -81,9 +91,13 @@ def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None
     official to take it from.
     """
     us_key, them_key = score_keys(match_id, set_no)
+    official = store.protocol_score(match_id, set_no)
+    # A set with a protocol starts with the score not being kept for you: the
+    # protocol already carries one for every point it holds, so adding to it as
+    # well would count those points twice. The toggle overrides this either way.
+    st.session_state.setdefault(auto_score_key(match_id, set_no), official is None)
     if us_key in st.session_state and them_key in st.session_state:
         return
-    official = store.protocol_score(match_id, set_no)
     us, them = official if official else store.current_score(events, match_id, set_no)
     st.session_state.setdefault(us_key, us)
     st.session_state.setdefault(them_key, them)
@@ -94,6 +108,18 @@ def current_video_id() -> str | None:
 
 
 # --- recording --------------------------------------------------------------
+
+# An error hands the rally to the other side - except a reception error, which
+# by request is not scored automatically and is left to the "+1 them" button.
+SCORE_THEM_EXCEPT = {schema.RECEPTION}
+
+# Both of these describe a set that was played out, so each one asks who it went
+# to and records the attack as well: one pass through the buttons, two events.
+CHAINED_SET_RESULTS = ("assist", "attempt")
+
+# How a chained attack can have ended. A kill is not here because that is what
+# the assist button already means.
+CHAIN_ATTACK_RESULTS = ("attempt", "error")
 
 def record(match: dict, player: dict, action: str, result: str, target_num=None) -> dict:
     """Move the score, write one event, and hand back the row that was written.
@@ -106,13 +132,11 @@ def record(match: dict, player: dict, action: str, result: str, target_num=None)
     set_no = int(st.session_state.set_no)
     us_key, them_key = score_keys(match_id, set_no)
 
-    # With an official protocol the score is already known for every point, so
-    # recording an action never moves it - that is what stops a correction from
-    # also inflating the set. Without one, keep count as you go.
-    if store.protocol_score(match_id, set_no) is None:
+    # Who the point goes to, when the score is ours to keep.
+    if auto_score(match_id, set_no):
         if schema.is_point(action, result):
             st.session_state[us_key] = int(st.session_state[us_key]) + 1
-        elif result == "error":
+        elif result == "error" and action not in SCORE_THEM_EXCEPT:
             st.session_state[them_key] = int(st.session_state[them_key]) + 1
 
     events = store.load_events()
@@ -142,6 +166,7 @@ def clear_selection() -> None:
     st.session_state.sel_action = None
     st.session_state.sel_result = None
     st.session_state.sel_player = None
+    st.session_state.sel_target = None
 
 
 def commit(match: dict, player: dict, action: str, result: str, target_num=None) -> None:
@@ -164,34 +189,55 @@ def cb_pick_result(result: str) -> None:
 
 
 def cb_pick_player(match: dict, player: dict) -> None:
-    """The player tap commits - unless it is an assist, which needs a target."""
+    """The player tap commits - unless it is a set, which needs a hitter."""
     action = st.session_state.sel_action
     result = st.session_state.sel_result
     if not action or not result:
         return
-    if action == schema.SET and result == "assist":
+    if action == schema.SET and result in CHAINED_SET_RESULTS:
         st.session_state.sel_player = player
         return
     commit(match, player, action, result)
 
 
 def cb_pick_target(match: dict, target: dict) -> None:
-    """The setter's assist and the hitter's kill, from the one tap.
+    """Who the set went to.
 
     An assist is by definition a set that ended in a kill, so the kill is
-    recorded too rather than asked for a second time. The protocol may already
-    hold that kill; recording it anyway is deliberate, because the point of
-    entering by hand is to complete what Profixio missed. A genuine double is
-    settled once in Review duplicates, which now remembers what you decided.
+    recorded straight away rather than asked for a second time. A plain set
+    attempt could have ended any number of ways, so that one asks.
     """
     setter = st.session_state.sel_player
     if not setter:
         return
-    assist = record(match, setter, schema.SET, "assist",
-                    target_num=int(target["number"]))
-    kill = record(match, target, schema.ATTACK, "kill")
+    if st.session_state.sel_result == "assist":
+        record_chain(match, setter, target, "kill")
+        return
+    st.session_state.sel_target = target
+
+
+def cb_pick_chain_result(match: dict, attack_result: str) -> None:
+    setter = st.session_state.sel_player
+    target = st.session_state.sel_target
+    if not setter or not target:
+        return
+    record_chain(match, setter, target, attack_result)
+
+
+def record_chain(match: dict, setter: dict, target: dict, attack_result: str) -> None:
+    """The setter's set and the hitter's attack, written as one move.
+
+    The protocol may already hold that kill; recording it anyway is deliberate,
+    because the point of entering by hand is to complete what Profixio missed.
+    A genuine double is settled once in Review duplicates, which remembers what
+    you decided.
+    """
+    set_result = st.session_state.sel_result or "assist"
+    the_set = record(match, setter, schema.SET, set_result,
+                     target_num=int(target["number"]))
+    attack = record(match, target, schema.ATTACK, attack_result)
     clear_selection()
-    flash("success", f"{describe(assist)}  ·  {describe(kill)}")
+    flash("success", f"{describe(the_set)}  ·  {describe(attack)}")
 
 
 def cb_clear_selection() -> None:
@@ -200,9 +246,7 @@ def cb_clear_selection() -> None:
 
 def cb_goto_set(set_no: int) -> None:
     st.session_state.set_no = int(set_no)
-    st.session_state.sel_action = None
-    st.session_state.sel_result = None
-    st.session_state.sel_player = None
+    clear_selection()
 
 
 def cb_bump(key: str, delta: int) -> None:
@@ -310,6 +354,9 @@ def sidebar_branding() -> None:
     else:
         st.sidebar.markdown("### ELDEN VBK")
         st.sidebar.caption("Add assets/elden-vbk.png for the club logo.")
+    # Which version is actually running, so a report of something going wrong
+    # can be matched to a line in CHANGELOG.md.
+    st.sidebar.caption(f"v{__version__}")
 
 
 def connect(spreadsheet_id: str, announce: bool = True) -> bool:
@@ -523,16 +570,27 @@ def sidebar_roster(roster: pd.DataFrame) -> None:
 
 # --- main panels ------------------------------------------------------------
 
-def scoreboard(match: dict, set_no: int) -> None:
-    us_key, them_key = score_keys(match["match_id"], set_no)
-    left, mid_a, mid_b, right = st.columns([3, 1, 1, 2])
-    left.markdown(
+def match_header(match: dict, set_no: int) -> None:
+    st.markdown(
         f"### {match['opponent']}  \n{match['date']} · {match['home_away']} · **set {set_no}**"
     )
-    mid_a.number_input("Us", min_value=0, step=1, key=us_key)
-    mid_b.number_input("Them", min_value=0, step=1, key=them_key)
-    right.markdown("&nbsp;", unsafe_allow_html=True)
-    bump_us, bump_them = right.columns(2)
+
+
+def score_controls(match: dict, set_no: int) -> None:
+    """The running score, and the switch for who keeps it.
+
+    Narrow on purpose: this goes beside the video, because the score is the
+    thing that gets forgotten while you are watching the match.
+    """
+    match_id = match["match_id"]
+    us_key, them_key = score_keys(match_id, set_no)
+    auto_key = auto_score_key(match_id, set_no)
+
+    us_col, them_col = st.columns(2)
+    us_col.number_input("Us", min_value=0, step=1, key=us_key)
+    them_col.number_input("Them", min_value=0, step=1, key=them_key)
+
+    bump_us, bump_them = st.columns(2)
     bump_us.button(
         "+1 us", key=f"bump::{us_key}", on_click=cb_bump, args=(us_key, 1), width="stretch",
         help="Point from an opponent error - no player event recorded",
@@ -541,6 +599,27 @@ def scoreboard(match: dict, set_no: int) -> None:
         "+1 them", key=f"bump::{them_key}", on_click=cb_bump, args=(them_key, 1),
         width="stretch", help="Opponent point",
     )
+
+    st.toggle(
+        "Keep the score for me",
+        key=auto_key,
+        help="A kill, an ace or a block point adds one to us; an error adds one to "
+             "them. A reception error does not - use +1 them for those, and for "
+             "every point that came from an opponent mistake.",
+    )
+    if st.session_state[auto_key] and store.protocol_score(match_id, set_no):
+        st.caption(
+            "This set has an official protocol, which already carries a score for "
+            "every point in it. Re-entering one of those points now moves the score too."
+        )
+
+
+def scoreboard(match: dict, set_no: int) -> None:
+    left, right = st.columns([3, 2])
+    with left:
+        match_header(match, set_no)
+    with right:
+        score_controls(match, set_no)
 
 
 def set_navigator(match: dict, set_no: int, match_events: pd.DataFrame) -> None:
@@ -725,17 +804,35 @@ def entry_buttons(roster: pd.DataFrame, match: dict) -> None:
                 + " — only add one if the protocol got it wrong."
             )
 
-    assist = action == schema.SET and result == "assist"
-    chosen = st.session_state.sel_player
-    if not (assist and chosen):
-        _player_row(squad, match, f"Player · {action.lower()} {result}", cb_pick_player)
+    # A set is half an event: the ball went to someone, and that attack ended.
+    # So a set walks on - setter, hitter, outcome - instead of being entered
+    # once as a set and again as an attack.
+    chained = action == schema.SET and result in CHAINED_SET_RESULTS
+    setter = st.session_state.sel_player
+    target = st.session_state.sel_target
 
-    # An assist needs one more tap: who it was set to.
-    if assist and chosen:
+    if not (chained and setter):
+        _player_row(squad, match, f"Player · {action.lower()} {result}", cb_pick_player)
+    elif not target:
         _player_row(
             squad, match,
-            f"#{chosen['number']} {chosen['name']} set it to…",
-            cb_pick_target, exclude=chosen["number"],
+            f"#{setter['number']} {setter['name']} set it to…",
+            cb_pick_target, exclude=setter["number"],
+        )
+    else:
+        st.caption(f"#{target['number']} {target['name']} attacked it…")
+        columns = st.columns(len(CHAIN_ATTACK_RESULTS) + 1)
+        for index, attack_result in enumerate(CHAIN_ATTACK_RESULTS):
+            columns[index].button(
+                f"attack {attack_result}",
+                key=f"chain::{attack_result}",
+                on_click=cb_pick_chain_result,
+                args=(match, attack_result),
+                width="stretch",
+            )
+        columns[-1].button(
+            "✕", key="chain_cancel", on_click=cb_clear_selection, width="stretch",
+            help="A kill is the assist button - start over and pick that instead.",
         )
 
 def entry_panel(roster: pd.DataFrame, match: dict) -> None:
@@ -815,8 +912,17 @@ def full_editor(match_events: pd.DataFrame, match_id: str) -> None:
         # both. Not (set, seq): seq restarts every set, so that would bury
         # tonight's work under set 1. `recorded_at` is not shown; it only sorts.
         display = store.newest_first(match_events, match_id)[schema.EVENT_COLUMNS].copy()
-        editable = ["set_no", "seq", "player_num", "action", "action_result"]
+        editable = ["set_no", "seq", "player_num", "player_name", "action", "action_result"]
         all_results = sorted({r for results in schema.ACTIONS.values() for r in results})
+        # Tapping the wrong player is the commonest mistake there is, so the
+        # name is a drop-down of everyone this match's line-up knows, and the
+        # shirt number stays typeable. Either one corrects the other; which of
+        # the two you changed is worked out in save_edits.
+        people = store.match_lineup(match_id)
+        names = sorted(
+            {str(name) for name in people["player_name"] if str(name).strip()}
+            | {str(name) for name in display["player_name"] if str(name).strip()}
+        )
         edited = st.data_editor(
             display,
             width="stretch",
@@ -826,7 +932,14 @@ def full_editor(match_events: pd.DataFrame, match_id: str) -> None:
             column_config={
                 "action": st.column_config.SelectboxColumn(options=list(schema.ACTIONS)),
                 "action_result": st.column_config.SelectboxColumn(options=all_results),
-                "player_num": st.column_config.NumberColumn("#", min_value=0, max_value=99),
+                "player_num": st.column_config.NumberColumn(
+                    "#", min_value=0, max_value=99,
+                    help="Or change the number - the name follows the line-up.",
+                ),
+                "player_name": st.column_config.SelectboxColumn(
+                    "player", options=names,
+                    help="Who it was really. Everyone in this match's line-up.",
+                ),
             },
             key=f"editor::{match_id}",
         )
@@ -850,7 +963,7 @@ def full_editor(match_events: pd.DataFrame, match_id: str) -> None:
 
 # What a row claims happened. Change any of it and a previous "yes, keep this"
 # was about a different row, so the review decision is withdrawn.
-CLAIM = ("set_no", "player_num", "action", "action_result")
+CLAIM = ("set_no", "player_num", "player_name", "action", "action_result")
 
 
 def cb_save_edits(match_id: str) -> None:
@@ -868,6 +981,10 @@ def save_edits(edited: pd.DataFrame, match_id: str) -> None:
     day. Looking a number up in the roster is how points scored by #4 in
     September came back stamped with the name of whoever wears #4 now.
     """
+    events = store.load_events()
+    before = events.set_index("event_id")
+    by_set = {}   # set_no -> line-up names, read once instead of once per row
+
     problems = []
     rows = []
     for position, row in enumerate(edited.to_dict("records"), start=1):
@@ -876,11 +993,25 @@ def save_edits(edited: pd.DataFrame, match_id: str) -> None:
         except schema.InvalidEvent as exc:
             problems.append(f"row {position}: {exc}")
             continue
-        # Resolve against the row's own set, which is itself editable. A number
-        # the line-up does not mention keeps the name it already carries rather
-        # than being blanked or guessed at.
-        names = store.names_for_set(match_id, int(row["set_no"]))
-        row["player_name"] = names.get(int(row["player_num"]), row["player_name"])
+        # Resolve against the row's own set, which is itself editable.
+        set_no = int(row["set_no"])
+        if set_no not in by_set:
+            by_set[set_no] = store.names_for_set(match_id, set_no)
+        names = by_set[set_no]
+        was = before.loc[row["event_id"]] if row["event_id"] in before.index else None
+        picked_name = (
+            was is not None and str(row["player_name"]) != str(was["player_name"])
+        )
+        if picked_name:
+            # The name was changed on purpose: give the event to that player,
+            # and bring the shirt number along from the line-up. A name the
+            # line-up does not know is still honoured - it is what you typed.
+            numbers = {str(name): number for number, name in names.items()}
+            row["player_num"] = numbers.get(str(row["player_name"]), row["player_num"])
+        else:
+            # A number the line-up does not mention keeps the name it already
+            # carries rather than being blanked or guessed at.
+            row["player_name"] = names.get(int(row["player_num"]), row["player_name"])
         row["action"], row["action_result"] = action, result
         row["is_point"] = schema.is_point(action, result)
         rows.append(row)
@@ -889,14 +1020,12 @@ def save_edits(edited: pd.DataFrame, match_id: str) -> None:
         flash("error", "Not saved - " + "; ".join(problems))
         return
 
-    events = store.load_events()
-    before = events.set_index("event_id")
     changed = []
     for row in rows:
         was = before.loc[row["event_id"]] if row["event_id"] in before.index else None
         if was is None:
             continue
-        fields = ["player_name", "is_point"] + list(CLAIM)
+        fields = ["is_point"] + list(CLAIM)
         if all(str(was[field]) == str(row[field]) for field in fields):
             continue   # untouched: leave its synced and reviewed flags alone
         row["synced"] = False   # edited rows need re-pushing
@@ -1413,7 +1542,10 @@ def official_comparison(match: dict, team_row, match_events: pd.DataFrame) -> No
         if not all_agree:
             st.caption(
                 "A set that doesn't match usually means events went in under the wrong "
-                "set number, or that set isn't finished yet."
+                "set number, or that set isn't finished yet. An imported protocol can "
+                "also stop short of the official score on its own: it only records "
+                "points **our** players scored, so a set that ended on opponent errors "
+                "is missing those last points until you add them with +1 us."
             )
 
 
@@ -1452,7 +1584,15 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
 
     on_top = st.session_state.video_layout == "On top"
     if show_video and on_top:
-        video_panel(match, max_height=int(st.session_state.video_height))
+        # The score shares the video's row rather than sitting under the entry
+        # buttons: both are then in one glance, and the score stops being the
+        # thing you remember to update three rallies late.
+        match_header(match, set_no)
+        video_col, score_col = st.columns([3, 2])
+        with video_col:
+            video_panel(match, max_height=int(st.session_state.video_height))
+        with score_col:
+            score_controls(match, set_no)
     elif show_video:
         share = int(st.session_state.video_width)
         left, right = st.columns([10 - share, share])
@@ -1473,7 +1613,6 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
         st.html(TIGHTEN_ENTRY)
         with st.container(key="entry_strip"):
             entry_buttons(roster, match)
-        scoreboard(match, set_no)
         set_navigator(match, set_no, match_events)
         with st.expander(f"Roles · set {set_no}"):
             role_editor(
