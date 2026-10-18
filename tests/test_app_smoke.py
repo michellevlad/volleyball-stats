@@ -1178,13 +1178,13 @@ def test_starting_over_mid_chain_writes_nothing(app):
 
 # --- who keeps the score ----------------------------------------------------
 
-def auto_key(set_no=1, match_id=None):
-    return f"auto_score::{match_id or MATCH['match_id']}::{set_no}"
+def mode_key(set_no=1, match_id=None):
+    return f"score_mode::{match_id or MATCH['match_id']}::{set_no}"
 
 
 def test_a_reception_error_is_not_scored_for_them(app):
     """Every other error hands the rally over; this one is left to +1 them."""
-    assert app.session_state[auto_key()] is True     # no protocol, so ours to keep
+    assert app.session_state[mode_key()] == "Count as I go"   # nothing official
     record(app, 7, schema.RECEPTION, "error")
     assert not app.exception
     row = store.load_events().iloc[0]
@@ -1197,32 +1197,70 @@ def test_every_other_error_still_goes_to_them(app):
     assert (int(row["score_us"]), int(row["score_them"])) == (0, 1)
 
 
-def test_turning_the_score_off_leaves_it_where_it_was(app):
-    app.session_state[auto_key()] = False
-    record(app, 7, schema.ATTACK, "kill")
+@needs_protocol
+def test_an_official_score_is_shown_not_offered(gated_app):
+    """A protocol set starts official: no box to type in, no +1 to press."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    assert gated_app.session_state[mode_key()] == "Official"
+    with pytest.raises(KeyError):
+        gated_app.button(key=f"bump::score_us::{MATCH['match_id']}::1")
+    with pytest.raises(KeyError):
+        gated_app.number_input(key=f"score_us::{MATCH['match_id']}::1")
+
+
+def test_an_official_set_is_the_published_score_not_the_protocols(temp_store, monkeypatch):
+    """A protocol only records points our own players scored.
+
+    So a set that ended on three opponent errors stops short in the protocol -
+    22-17 against a published 25-20 - and it was that short score the app was
+    showing and stamping onto everything entered afterwards.
+    """
+    monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
+    store.save_roster(pd.DataFrame([
+        {"player_id": "", "number": 7, "name": "Ana", "position": "OH", "active": True},
+    ]))
+    store.upsert_match({**MATCH, "official_sets": "25-20", "official_result": "1-0"})
+    store.replace_profixio_events(MATCH["match_id"], [store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 7, "name": "Ana"},
+        action=schema.SERVE, result="ace",
+        score_us=22, score_them=17,
+        source=schema.SOURCE_PROFIXIO,
+    )])
+
+    app = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
     assert not app.exception
-    row = store.load_events().iloc[0]
-    assert (int(row["score_us"]), int(row["score_them"])) == (0, 0)
+    assert app.session_state[f"score_mode::{MATCH['match_id']}::1"] == "Official"
+    assert (int(app.session_state[f"score_us::{MATCH['match_id']}::1"]),
+            int(app.session_state[f"score_them::{MATCH['match_id']}::1"])) == (25, 20)
+
+    # And what you enter next carries that score, so the set reconciles.
+    record(app, 7, schema.DIG, "dig")
+    assert int(store.load_events().iloc[-1]["score_us"]) == 25
 
 
 @needs_protocol
-def test_a_set_with_a_protocol_does_not_keep_the_score_for_you(gated_app):
-    """The protocol already carries a score for every point it holds."""
+def test_counting_a_protocol_set_yourself_starts_from_nothing(gated_app):
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
-    assert gated_app.session_state[auto_key()] is False
-
-
-@needs_protocol
-def test_but_you_can_turn_it_on_anyway(gated_app):
-    import_jomala_protocol(MATCH["match_id"])
-    gated_app.button(key="start_entering").click().run()
-    before = int(gated_app.session_state[f"score_us::{MATCH['match_id']}::1"])
-    gated_app.session_state[auto_key()] = True
-    record(gated_app, 7, schema.ATTACK, "kill")
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
     assert not gated_app.exception
-    after = int(store.load_events().iloc[-1]["score_us"])
-    assert after == before + 1
+
+    us_key = f"score_us::{MATCH['match_id']}::1"
+    assert int(gated_app.session_state[us_key]) == 0      # not 25
+    record(gated_app, 7, schema.ATTACK, "kill")
+    assert int(store.load_events().iloc[-1]["score_us"]) == 1
+
+
+@needs_protocol
+def test_switching_back_restores_the_official_score(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
+    gated_app.radio(key=mode_key()).set_value("Official").run()
+    assert not gated_app.exception
+    assert int(gated_app.session_state[f"score_us::{MATCH['match_id']}::1"]) == 25
 
 
 # --- correcting who an event belongs to -------------------------------------
@@ -1250,20 +1288,14 @@ def test_picking_a_name_moves_the_event_to_that_player(app):
 
 
 @needs_protocol
-def test_a_reopened_set_keeps_the_points_you_added_by_hand(gated_app):
-    """The protocol stops at the last point our own players scored.
-
-    A set that finished on opponent errors is ahead of its protocol, and that
-    lead was being thrown away every time the app was opened again.
-    """
+def test_counting_picks_up_where_you_left_off(gated_app):
+    """A set counted across two sittings must not start again at 0-0."""
     import_jomala_protocol(MATCH["match_id"])
     gated_app.button(key="start_entering").click().run()
-    us_key = f"score_us::{MATCH['match_id']}::1"
-    official = int(gated_app.session_state[us_key])
-
-    gated_app.button(key=f"bump::{us_key}").click().run()      # an opponent error
-    assert int(gated_app.session_state[us_key]) == official + 1
-    record(gated_app, 7, schema.DIG, "dig")                    # carries it onto an event
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
+    record(gated_app, 7, schema.ATTACK, "kill")
+    record(gated_app, 7, schema.ATTACK, "kill")
 
     fresh = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
-    assert int(fresh.session_state[us_key]) == official + 1
+    fresh.radio(key=mode_key()).set_value("Count as I go").run()
+    assert int(fresh.session_state[f"score_us::{MATCH['match_id']}::1"]) == 2

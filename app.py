@@ -74,39 +74,80 @@ def score_keys(match_id: str, set_no: int) -> tuple[str, str]:
     return f"score_us::{match_id}::{set_no}", f"score_them::{match_id}::{set_no}"
 
 
-def auto_score_key(match_id: str, set_no: int) -> str:
-    return f"auto_score::{match_id}::{set_no}"
+# A set's score is either the official one or one you are counting yourself.
+# Mixing them is what made the old toggle confusing: the official score was
+# sitting in a box you could type into, so it looked like a starting point.
+SCORE_OFFICIAL = "Official"
+SCORE_COUNT = "Count as I go"
 
 
-def auto_score(match_id: str, set_no: int) -> bool:
-    """Is this set's score ours to keep as we record, or kept by hand?"""
-    return bool(st.session_state.get(auto_score_key(match_id, set_no), False))
+def score_mode_key(match_id: str, set_no: int) -> str:
+    return f"score_mode::{match_id}::{set_no}"
 
 
-def ensure_score_state(events: pd.DataFrame, match_id: str, set_no: int) -> None:
-    """Seed the score widgets, preferring the official record.
+def official_set_score(match: dict, set_no: int):
+    """The official score of a set, or None if nothing official knows it.
 
-    A set with a protocol already has a score for every point, so take it. The
-    running total only has to be maintained by hand when there is nothing
-    official to take it from.
+    The fixture row carries the set scores as the league published them, so it
+    is asked first. The protocol is the fallback: it only knows the points our
+    own players scored, so it stops short of the real score whenever a set
+    ended on an opponent error.
     """
+    published = [
+        part.strip() for part in str(match.get("official_sets", "") or "").split(",")
+        if part.strip()
+    ]
+    if 1 <= int(set_no) <= len(published):
+        us, _, them = published[int(set_no) - 1].partition("-")
+        if us.strip().isdigit() and them.strip().isdigit():
+            return int(us), int(them)
+    return store.protocol_score(match["match_id"], int(set_no))
+
+
+def counting_score(match: dict, set_no: int) -> bool:
+    """Is this set's score ours to count as we record, or the official one?"""
+    if not official_set_score(match, set_no):
+        return True      # nothing official to follow, so it can only be ours
+    return st.session_state.get(score_mode_key(match["match_id"], set_no)) == SCORE_COUNT
+
+
+def cb_score_mode(match: dict, set_no: int) -> None:
+    """Switching mode re-reads the score from whichever source now owns it."""
+    match_id = match["match_id"]
     us_key, them_key = score_keys(match_id, set_no)
-    official = store.protocol_score(match_id, set_no)
-    # A set with a protocol starts with the score not being kept for you: the
-    # protocol already carries one for every point it holds, so adding to it as
-    # well would count those points twice. The toggle overrides this either way.
-    st.session_state.setdefault(auto_score_key(match_id, set_no), official is None)
+    if counting_score(match, set_no):
+        st.session_state[us_key], st.session_state[them_key] = store.manual_score(
+            match_id, set_no
+        )
+    else:
+        official = official_set_score(match, set_no)
+        if official:
+            st.session_state[us_key], st.session_state[them_key] = official
+
+
+def ensure_score_state(match: dict, set_no: int) -> None:
+    """Seed the score, from whichever of the two sources owns this set.
+
+    A set whose score is official doesn't need seeding so much as holding: it
+    is re-read every run, because nothing in the app is allowed to move it.
+    """
+    match_id = match["match_id"]
+    us_key, them_key = score_keys(match_id, set_no)
+    official = official_set_score(match, set_no)
+    # Which side starts out owning the score. Keyed on the protocol rather than
+    # on `official` above: a published set score with no protocol behind it is a
+    # set nobody has entered yet, and entering it is counting it. The protocol is
+    # what says "this set is already recorded, read it rather than count it".
+    st.session_state.setdefault(
+        score_mode_key(match_id, set_no),
+        SCORE_OFFICIAL if store.protocol_score(match_id, set_no) else SCORE_COUNT,
+    )
+    if not counting_score(match, set_no):
+        st.session_state[us_key], st.session_state[them_key] = official
+        return
     if us_key in st.session_state and them_key in st.session_state:
         return
-    us, them = store.current_score(events, match_id, set_no)
-    if official:
-        # The protocol is a floor, not a ceiling. It only knows the points our
-        # own players scored, so a set that ended on opponent errors stops short
-        # of the real score - and reopening the app must not throw away the
-        # points you added by hand to get there.
-        us, them = max(us, official[0]), max(them, official[1])
-    st.session_state.setdefault(us_key, us)
-    st.session_state.setdefault(them_key, them)
+    st.session_state[us_key], st.session_state[them_key] = store.manual_score(match_id, set_no)
 
 
 def current_video_id() -> str | None:
@@ -139,7 +180,7 @@ def record(match: dict, player: dict, action: str, result: str, target_num=None)
     us_key, them_key = score_keys(match_id, set_no)
 
     # Who the point goes to, when the score is ours to keep.
-    if auto_score(match_id, set_no):
+    if counting_score(match, set_no):
         if schema.is_point(action, result):
             st.session_state[us_key] = int(st.session_state[us_key]) + 1
         elif result == "error" and action not in SCORE_THEM_EXCEPT:
@@ -583,40 +624,47 @@ def match_header(match: dict, set_no: int) -> None:
 
 
 def score_controls(match: dict, set_no: int) -> None:
-    """The running score, and the switch for who keeps it.
+    """The score, and which of the two kinds of score it is.
 
-    Narrow on purpose: this goes beside the video, because the score is the
-    thing that gets forgotten while you are watching the match.
+    One row, so that putting it where you can see it costs the video nothing.
+    An official score is shown, not offered: there is no box to type in and no
+    +1 to press, because the league has already settled it.
     """
     match_id = match["match_id"]
     us_key, them_key = score_keys(match_id, set_no)
-    auto_key = auto_score_key(match_id, set_no)
+    official = official_set_score(match, set_no)
+    counting = counting_score(match, set_no)
 
-    us_col, them_col = st.columns(2)
-    us_col.number_input("Us", min_value=0, step=1, key=us_key)
-    them_col.number_input("Them", min_value=0, step=1, key=them_key)
+    slots = st.columns([1, 1, 1, 1, 2] if counting else [3, 2],
+                       vertical_alignment="bottom")
+    if counting:
+        slots[0].number_input("Us", min_value=0, step=1, key=us_key)
+        slots[1].number_input("Them", min_value=0, step=1, key=them_key)
+        slots[2].button(
+            "+1 us", key=f"bump::{us_key}", on_click=cb_bump, args=(us_key, 1),
+            width="stretch",
+            help="Point from an opponent error - no player event recorded",
+        )
+        slots[3].button(
+            "+1 them", key=f"bump::{them_key}", on_click=cb_bump, args=(them_key, 1),
+            width="stretch", help="Opponent point",
+        )
+    else:
+        slots[0].markdown(f"## {official[0]} – {official[1]}")
 
-    bump_us, bump_them = st.columns(2)
-    bump_us.button(
-        "+1 us", key=f"bump::{us_key}", on_click=cb_bump, args=(us_key, 1), width="stretch",
-        help="Point from an opponent error - no player event recorded",
-    )
-    bump_them.button(
-        "+1 them", key=f"bump::{them_key}", on_click=cb_bump, args=(them_key, 1),
-        width="stretch", help="Opponent point",
-    )
-
-    st.toggle(
-        "Keep the score for me",
-        key=auto_key,
-        help="A kill, an ace or a block point adds one to us; an error adds one to "
-             "them. A reception error does not - use +1 them for those, and for "
-             "every point that came from an opponent mistake.",
-    )
-    if st.session_state[auto_key] and store.protocol_score(match_id, set_no):
-        st.caption(
-            "This set has an official protocol, which already carries a score for "
-            "every point in it. Re-entering one of those points now moves the score too."
+    if official:
+        slots[-1].radio(
+            "Score",
+            [SCORE_OFFICIAL, SCORE_COUNT],
+            key=score_mode_key(match_id, set_no),
+            on_change=cb_score_mode,
+            args=(match, set_no),
+            horizontal=True,
+            label_visibility="collapsed",
+            help="Official is Profixio's score for this set, and nothing you record "
+                 "moves it. Count as I go starts from wherever your own counting had "
+                 "got to - 0-0 on a set you have not counted yet - and follows what "
+                 "you enter: a kill, ace or block point to us, an error to them.",
         )
 
 
@@ -1548,10 +1596,9 @@ def official_comparison(match: dict, team_row, match_events: pd.DataFrame) -> No
         if not all_agree:
             st.caption(
                 "A set that doesn't match usually means events went in under the wrong "
-                "set number, or that set isn't finished yet. An imported protocol can "
-                "also stop short of the official score on its own: it only records "
-                "points **our** players scored, so a set that ended on opponent errors "
-                "is missing those last points until you add them with +1 us."
+                "set number, or that set isn't finished yet. A set you are counting "
+                "yourself only moves when you record something, so points that came "
+                "from an opponent mistake need **+1 us**."
             )
 
 
@@ -1585,20 +1632,17 @@ def workspace(match: dict, roster: pd.DataFrame, matches: pd.DataFrame) -> None:
     # video panel is handled inline, not in a callback, so unlike the button
     # grid it reaches commit() during this very first script run.
     events = store.load_events()
-    ensure_score_state(events, match_id, set_no)
+    ensure_score_state(match, set_no)
     ensure_set_lineup(match_id, set_no, roster, match)
 
     on_top = st.session_state.video_layout == "On top"
     if show_video and on_top:
-        # The score shares the video's row rather than sitting under the entry
-        # buttons: both are then in one glance, and the score stops being the
-        # thing you remember to update three rallies late.
+        # Header, video, then the score immediately under it - still in view
+        # while you watch, but not taking any width off the thing you came to
+        # look at.
         match_header(match, set_no)
-        video_col, score_col = st.columns([3, 2])
-        with video_col:
-            video_panel(match, max_height=int(st.session_state.video_height))
-        with score_col:
-            score_controls(match, set_no)
+        video_panel(match, max_height=int(st.session_state.video_height))
+        score_controls(match, set_no)
     elif show_video:
         share = int(st.session_state.video_width)
         left, right = st.columns([10 - share, share])

@@ -227,10 +227,17 @@ after you have already recorded events and those events are updated too, so the 
 
 ### The score
 
-The score sits **beside the video**, so it is in view while you watch rather than somewhere below
-the buttons.
+The score sits **directly under the video**, in one row, so it is in view while you watch without
+costing the video any width.
 
-**Keep the score for me** is a switch under it. With it on, every event you record moves the score:
+A set's score is one of two things, and the switch beside it says which:
+
+**Official** — Profixio's score for that set. It is *shown*, not offered: there is no box to type
+in and no **+1** to press, because the league has already settled it. A set is official the moment
+its protocol has been imported.
+
+**Count as I go** — yours. It starts at **0-0** on a set you haven't counted yet (or wherever your
+own counting had got to, if you are coming back to one), and follows what you record:
 
 | What you record | Score |
 |---|---|
@@ -240,12 +247,7 @@ the buttons.
 | everything else | nothing |
 
 Points that came from an *opponent* mistake have no event of ours at all, so those are **+1 us** by
-hand. You can always type over either number.
-
-The switch starts **off** for a set whose official protocol has been imported, because that
-protocol already carries the exact score of every point it holds; adding to it as well would count
-those points twice. Turn it on if you are entering a set by hand anyway — the warning under the
-switch says when that applies.
+hand. You can type over either number whenever you like.
 
 ---
 
@@ -274,10 +276,10 @@ switch says when that applies.
   | Set 3 | 25-6 | — | not entered yet |
   | Result | 3-0 | 2-0 | ⚠️ |
 
-  A set can read ⚠️ with nothing wrong in it. **An imported protocol only records points *our*
-  players scored** — aces, kills and block points. If a set ended on opponent errors, the last
-  points of it have no event to carry them, so a freshly imported 25-20 shows as 22-17 until you
-  add the missing three with **+1 us**.
+  The check is about **sets you counted yourself** — a ⚠️ there means events went in under the
+  wrong set number, or the set isn't finished, or you missed the **+1 us** on a point that came
+  from an opponent error. A set whose score is **Official** is taking Profixio's own number, so of
+  course it agrees; switch it to **Count as I go** if you want the comparison to test something.
 - Re-importing the protocol is always safe: it replaces only the imported rows and never touches
   anything you entered from the video.
 
@@ -498,7 +500,7 @@ read the player clock, and once that was no longer needed it was pure risk: if i
 re-initialise after a rebuild, the panel stayed blank.
 
 ```bash
-.venv/bin/python -m pytest -q      # 312 tests
+.venv/bin/python -m pytest -q      # 313 tests
 ```
 
 ### Releasing
