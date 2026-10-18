@@ -426,7 +426,11 @@ def sidebar_match(matches: pd.DataFrame) -> None:
         st.session_state.setup_done_for = ""
         st.rerun()
 
-    st.sidebar.radio("Set", [1, 2, 3, 4, 5], key="set_no", horizontal=True)
+    # No set control here. It used to be a sidebar radio, and because the
+    # workspace is a fragment the sidebar is not re-rendered when you tap
+    # inside it - so the radio went stale and snapped back to set 1 on the next
+    # full rerun, quietly filing events against the wrong set. The set strip
+    # under the score is inside the fragment and owns this now.
 
     st.sidebar.subheader("Video")
     st.sidebar.toggle("Show video", key="show_video")

@@ -425,7 +425,7 @@ def test_roles_default_from_the_roster_and_carry_forward(gated_app):
     assert s.role_of(MATCH["match_id"], 1, 7) == "OH"
 
     # Switching set copies the previous set's roles rather than starting blank.
-    gated_app.radio(key="set_no").set_value(2).run()
+    gated_app.button(key="goto_set::2").click().run()
     assert not gated_app.exception
     assert s.role_of(MATCH["match_id"], 2, 7) == "OH"
 
@@ -473,7 +473,7 @@ def test_the_same_player_in_two_roles_gets_two_rows(gated_app):
 
     gated_app.button(key="start_entering").click().run()
     record(gated_app, 7, schema.ATTACK, "attempt")
-    gated_app.radio(key="set_no").set_value(2).run()
+    gated_app.button(key="goto_set::2").click().run()
     record(gated_app, 7, schema.ATTACK, "attempt")
     assert not gated_app.exception
 
@@ -498,7 +498,7 @@ def comparison_table(app):
 
 def record_set(app, set_no, us, them):
     """Enter one event and set the running score, as if that set had finished."""
-    app.radio(key="set_no").set_value(set_no).run()
+    app.button(key=f"goto_set::{set_no}").click().run()
     app.session_state[f"score_us::{MATCH['match_id']}::{set_no}"] = us
     app.session_state[f"score_them::{MATCH['match_id']}::{set_no}"] = them
     app.run()
@@ -850,3 +850,54 @@ def test_nothing_happens_until_apply(gated_app):
 
     gated_app.button(key="reopen_setup").click().run()
     assert len(store.load_events()) == before     # rendering the panel changes nothing
+
+
+# --- the set must not move underneath you -----------------------------------
+
+def test_the_set_survives_every_kind_of_tap(gated_app):
+    """It was a sidebar radio, outside the fragment, and snapped back to 1.
+
+    Recording against the wrong set is close to invisible while it happens, so
+    this walks the whole entry loop and checks the set after every step.
+    """
+    gated_app.button(key="start_entering").click().run()
+    gated_app.button(key="goto_set::2").click().run()
+    assert gated_app.session_state["set_no"] == 2
+
+    gated_app.button(key=f"action::{schema.ATTACK}").click().run()
+    assert gated_app.session_state["set_no"] == 2
+    gated_app.button(key=f"result::{schema.ATTACK}::attempt").click().run()
+    assert gated_app.session_state["set_no"] == 2
+    gated_app.button(key="player::p7").click().run()
+    assert gated_app.session_state["set_no"] == 2
+
+    # ...and the event landed on set 2, which is the thing that matters.
+    assert int(store.load_events().iloc[-1]["set_no"]) == 2
+
+    # A full rerun must not undo it either.
+    gated_app.run()
+    assert gated_app.session_state["set_no"] == 2
+    record(gated_app, 7, schema.DIG, "dig")
+    assert int(store.load_events().iloc[-1]["set_no"]) == 2
+
+
+def test_the_set_is_only_changed_by_the_set_strip(gated_app):
+    gated_app.button(key="start_entering").click().run()
+    gated_app.button(key="goto_set::3").click().run()
+
+    # Undo, score buttons and the roles table all leave it alone.
+    record(gated_app, 7, schema.ATTACK, "attempt")
+    event_id = store.load_events().iloc[-1]["event_id"]
+    gated_app.button(key=f"undo::{event_id}").click().run()
+    assert gated_app.session_state["set_no"] == 3
+
+    gated_app.button(key=f"bump::score_them::{MATCH['match_id']}::3").click().run()
+    assert gated_app.session_state["set_no"] == 3
+    assert not gated_app.exception
+
+
+def test_there_is_only_one_set_control(gated_app):
+    """Two of them is how the sidebar one went stale without being noticed."""
+    gated_app.button(key="start_entering").click().run()
+    assert not [r for r in gated_app.radio if r.key == "set_no"]
+    assert len([b for b in gated_app.button if b.key.startswith("goto_set::")]) == 5
