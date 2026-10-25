@@ -369,3 +369,9 @@ def test_empty_input_gives_an_empty_per_set_table():
     empty = pd.DataFrame(columns=schema.EVENT_COLUMNS)
     out = stats.player_set_stats(empty)
     assert len(out) == 0 and list(out.columns) == schema.SET_STATS_COLUMNS
+
+
+def test_a_set_result_does_not_read_like_a_set_number():
+    """'set' as a result read the same as the set being entered."""
+    assert schema.result_label(schema.SET, "attempt") == "set attempt"
+    assert schema.result_label(schema.SET, "assist") == "assist"

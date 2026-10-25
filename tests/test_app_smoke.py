@@ -26,13 +26,15 @@ def offline(app):
     return app
 
 
-def record(app, number, action, result, target=None):
+def record(app, number, action, result, target=None, attack=None):
     """Record one event the only way there is now: action, result, player."""
     app.button(key=f"action::{action}").click().run()
     app.button(key=f"result::{action}::{result}").click().run()
     app.button(key=f"player::p{number}").click().run()
-    if target is not None:                      # an assist needs a fourth tap
+    if target is not None:                      # a set needs a fourth tap
         app.button(key=f"target::p{target}").click().run()
+    if attack is not None:                      # and a plain set, a fifth
+        app.button(key=f"chain::{attack}").click().run()
     return app
 
 
@@ -1122,3 +1124,178 @@ def test_a_new_event_after_a_review_is_unreviewed(gated_app):
     # The settled one stays settled; only the new one is asked about.
     assert sorted(bool(v) for v in mine["reviewed"]) == [False, True]
     assert sorted(bool(v) for v in mine["keep"]) == [False, True]
+
+
+# --- a plain set walks on to the hitter too (#6) ----------------------------
+
+def test_a_set_attempt_asks_for_the_hitter_and_the_outcome(app):
+    record(app, 12, schema.SET, "attempt", target=7, attack="attempt")
+    assert not app.exception
+
+    events = store.load_events()
+    assert len(events) == 2
+    the_set = events[events["action"] == schema.SET].iloc[0]
+    attack = events[events["action"] == schema.ATTACK].iloc[0]
+    assert (the_set["player_num"], the_set["action_result"]) == (12, "attempt")
+    assert int(the_set["target_num"]) == 7
+    assert (attack["player_num"], attack["action_result"]) == (7, "attempt")
+    assert the_set["seq"] != attack["seq"]
+
+
+def test_the_hitter_is_asked_before_anything_is_written(app):
+    """Picking the hitter must not commit on its own - the outcome is still open."""
+    app.button(key=f"action::{schema.SET}").click().run()
+    app.button(key=f"result::{schema.SET}::attempt").click().run()
+    app.button(key="player::p12").click().run()
+    app.button(key="target::p7").click().run()
+    assert not app.exception
+    assert len(store.load_events()) == 0
+    assert app.session_state["sel_target"]["number"] == 7
+    assert app.button(key="chain::attempt")      # the outcome row is up
+
+
+def test_an_attack_error_off_a_set_gives_them_the_point(app):
+    record(app, 12, schema.SET, "attempt", target=7, attack="error")
+    assert not app.exception
+
+    attack = store.load_events()
+    attack = attack[attack["action"] == schema.ATTACK].iloc[0]
+    assert attack["action_result"] == "error"
+    assert (int(attack["score_us"]), int(attack["score_them"])) == (0, 1)
+
+
+def test_starting_over_mid_chain_writes_nothing(app):
+    app.button(key=f"action::{schema.SET}").click().run()
+    app.button(key=f"result::{schema.SET}::attempt").click().run()
+    app.button(key="player::p12").click().run()
+    app.button(key="target::p7").click().run()
+    app.button(key="chain_cancel").click().run()
+    assert not app.exception
+    assert len(store.load_events()) == 0
+    assert app.session_state["sel_player"] is None
+    assert app.session_state["sel_target"] is None
+
+
+# --- who keeps the score ----------------------------------------------------
+
+def mode_key(set_no=1, match_id=None):
+    return f"score_mode::{match_id or MATCH['match_id']}::{set_no}"
+
+
+def test_a_reception_error_is_not_scored_for_them(app):
+    """Every other error hands the rally over; this one is left to +1 them."""
+    assert app.session_state[mode_key()] == "Count as I go"   # nothing official
+    record(app, 7, schema.RECEPTION, "error")
+    assert not app.exception
+    row = store.load_events().iloc[0]
+    assert (int(row["score_us"]), int(row["score_them"])) == (0, 0)
+
+
+def test_every_other_error_still_goes_to_them(app):
+    record(app, 7, schema.SERVE, "error")
+    row = store.load_events().iloc[0]
+    assert (int(row["score_us"]), int(row["score_them"])) == (0, 1)
+
+
+@needs_protocol
+def test_an_official_score_is_shown_not_offered(gated_app):
+    """A protocol set starts official: no box to type in, no +1 to press."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    assert gated_app.session_state[mode_key()] == "Official"
+    with pytest.raises(KeyError):
+        gated_app.button(key=f"bump::score_us::{MATCH['match_id']}::1")
+    with pytest.raises(KeyError):
+        gated_app.number_input(key=f"score_us::{MATCH['match_id']}::1")
+
+
+def test_an_official_set_is_the_published_score_not_the_protocols(temp_store, monkeypatch):
+    """A protocol only records points our own players scored.
+
+    So a set that ended on three opponent errors stops short in the protocol -
+    22-17 against a published 25-20 - and it was that short score the app was
+    showing and stamping onto everything entered afterwards.
+    """
+    monkeypatch.setattr(video, "video_panel", lambda *args, **kwargs: None)
+    store.save_roster(pd.DataFrame([
+        {"player_id": "", "number": 7, "name": "Ana", "position": "OH", "active": True},
+    ]))
+    store.upsert_match({**MATCH, "official_sets": "25-20", "official_result": "1-0"})
+    store.replace_profixio_events(MATCH["match_id"], [store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 7, "name": "Ana"},
+        action=schema.SERVE, result="ace",
+        score_us=22, score_them=17,
+        source=schema.SOURCE_PROFIXIO,
+    )])
+
+    app = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
+    assert not app.exception
+    assert app.session_state[f"score_mode::{MATCH['match_id']}::1"] == "Official"
+    assert (int(app.session_state[f"score_us::{MATCH['match_id']}::1"]),
+            int(app.session_state[f"score_them::{MATCH['match_id']}::1"])) == (25, 20)
+
+    # And what you enter next carries that score, so the set reconciles.
+    record(app, 7, schema.DIG, "dig")
+    assert int(store.load_events().iloc[-1]["score_us"]) == 25
+
+
+@needs_protocol
+def test_counting_a_protocol_set_yourself_starts_from_nothing(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
+    assert not gated_app.exception
+
+    us_key = f"score_us::{MATCH['match_id']}::1"
+    assert int(gated_app.session_state[us_key]) == 0      # not 25
+    record(gated_app, 7, schema.ATTACK, "kill")
+    assert int(store.load_events().iloc[-1]["score_us"]) == 1
+
+
+@needs_protocol
+def test_switching_back_restores_the_official_score(gated_app):
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
+    gated_app.radio(key=mode_key()).set_value("Official").run()
+    assert not gated_app.exception
+    assert int(gated_app.session_state[f"score_us::{MATCH['match_id']}::1"]) == 25
+
+
+# --- correcting who an event belongs to -------------------------------------
+
+def test_picking_a_name_moves_the_event_to_that_player(app):
+    """The tap landed on the wrong player; the name is how you say so."""
+    store.set_lineup(MATCH["match_id"], 1, [
+        {"player_num": 7, "player_name": "Ana", "player_role": "OH"},
+        {"player_num": 12, "player_name": "Bea", "player_role": "S"},
+    ])
+    store.append_event(store.build_event(
+        match=MATCH, set_no=1, seq=1,
+        player={"number": 7, "name": "Ana"},
+        action=schema.ATTACK, result="kill",
+    ))
+
+    frame = editor_rows(app)
+    frame.loc[frame.index[0], "player_name"] = "Bea"
+    save_editor(app, frame)
+
+    assert not app.exception
+    saved = store.load_events().iloc[0]
+    assert saved["player_name"] == "Bea"
+    assert saved["player_num"] == 12          # the shirt follows the name
+
+
+@needs_protocol
+def test_counting_picks_up_where_you_left_off(gated_app):
+    """A set counted across two sittings must not start again at 0-0."""
+    import_jomala_protocol(MATCH["match_id"])
+    gated_app.button(key="start_entering").click().run()
+    gated_app.radio(key=mode_key()).set_value("Count as I go").run()
+    record(gated_app, 7, schema.ATTACK, "kill")
+    record(gated_app, 7, schema.ATTACK, "kill")
+
+    fresh = past_setup(AppTest.from_file(APP, default_timeout=30)).run()
+    fresh.radio(key=mode_key()).set_value("Count as I go").run()
+    assert int(fresh.session_state[f"score_us::{MATCH['match_id']}::1"]) == 2
